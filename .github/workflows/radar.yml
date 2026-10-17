@@ -9,6 +9,10 @@ on:
         description: "Opcional: solo productos que contengan esta palabra (ej. cocina)"
         required: false
         default: ""
+      rondas:
+        description: "Rondas de búsqueda en Apify (1 = prueba barata, ~1 $; hasta 3)"
+        required: false
+        default: "1"
       dataset_id:
         description: "Opcional: ID de un dataset de Apify ya descargado (no gasta crédito)"
         required: false
@@ -34,4 +38,5 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           PALABRA: ${{ github.event.inputs.palabra }}
           DATASET_ID: ${{ github.event.inputs.dataset_id }}
+          RONDAS_MAX: ${{ github.event.inputs.rondas || '3' }}
         run: python bot.py
