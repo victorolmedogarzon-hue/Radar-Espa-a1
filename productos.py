@@ -1,252 +1,293 @@
-"""
-Radar de productos ganadores: anuncios TOP de TikTok en España.
+"""Radar de productos ganadores ORGÁNICOS en TikTok España (para dropshipping).
 
-Usa el scraper de Apify "scrapesage/tiktok-ad-library-scraper" (fuente Creative Center
-Top Ads), saca la página de venta de cada anuncio, agrupa por producto y manda a Telegram
-los más repetidos / con mejor CTR, con enlaces para validarlos.
-
-Necesita los secrets: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID y APIFY_TOKEN.
+Flujo: Apify (vídeos orgánicos por hashtag/búsqueda) -> filtro anti-anuncios y
+antigüedad -> puntuación (interacción + viralidad relativa) -> extracción del
+producto con IA (opcional) -> agrupación por producto -> ranking.
 """
-import html
+import json
 import os
 import re
-import sys
-import time
-from urllib.parse import quote_plus, urlparse
+import unicodedata
+from datetime import datetime, timedelta, timezone
+from urllib.parse import quote_plus
 
 import requests
+from apify_client import ApifyClient
 
-# ───────────────────────── AJUSTES (puedes editarlos) ─────────────────────────
-ACTOR = "scrapesage~tiktok-ad-library-scraper"
-PAIS = "ES"
-PERIODO = "30"            # días del ranking: "7", "30" o "180"
-INDUSTRIAS = [            # si TikTok no reconoce un nombre, simplemente lo salta
-    "E-commerce", "Beauty & Personal Care", "Household Products", "Home Improvement",
-    "Health", "Pets", "Sports & Outdoor", "Tech & Electronics",
+ACTOR = "clockworks/tiktok-scraper"
+
+# ---------------------------------------------------------------- AJUSTES
+HASHTAGS = [
+    "tiktokmademebuyit", "tiktokmehizocomprarlo", "productoviral",
+    "comprastiktok", "amazonfinds", "gadgetsutiles", "hogarutil",
+    "cosasdealiexpress", "cosasutiles", "descubrimientostiktok",
 ]
-MAX_ANUNCIOS = 60         # tope de anuncios por ejecución (controla el gasto)
-MAX_COSTE_USD = 1.0       # tope de gasto por ejecución en Apify
-TOP = 10                  # productos que se mandan a Telegram
+BUSQUEDAS = [
+    "producto viral", "me compré esto", "dónde lo compro",
+    "esto es una locura producto", "gadget útil", "no sabía que existía",
+]
+VIDEOS_POR_TERMINO = 40      # vídeos que pide a Apify por hashtag/búsqueda
+DIAS_MAX = 14                # solo vídeos de los últimos X días
+MIN_VISTAS = 20_000          # descarta vídeos con pocas vistas
+MAX_VIDEOS_A_IA = 80         # cuántos vídeos top se analizan con IA
+TOP_PRODUCTOS = 10           # cuántos productos se envían
 
-API = "https://api.apify.com/v2"
-STOPWORDS = {"de", "del", "la", "el", "los", "las", "y", "con", "sin", "para", "en", "un",
-             "una", "por", "a", "al", "o", "e", "the", "and", "for", "with", "your", "you"}
-HOSTS_NO_PRODUCTO = ("apps.apple.com", "play.google.com", "tiktok.com", "instagram.com",
-                     "facebook.com", "wa.me", "t.me")
-
-
-# ───────────────────────── Apify ─────────────────────────
-class ApifyError(Exception):
-    pass
-
-
-def _cab() -> dict:
-    return {"Authorization": f"Bearer {os.environ['APIFY_TOKEN']}"}
-
-
-def lanzar_scraper(con_idioma: bool = True) -> list[dict]:
-    entrada = {
-        "source": "creative-center",
-        "countryCodes": [PAIS],
-        "period": PERIODO,
-        "orderBy": "ctr",
-        "industries": INDUSTRIAS,
-        "includeAdDetails": True,   # necesario para obtener la página de venta
-        "includeVideoUrl": False,
-        "maxResults": MAX_ANUNCIOS,
-    }
-    if con_idioma:
-        entrada["adLanguages"] = ["es"]
-
-    r = requests.post(f"{API}/acts/{ACTOR}/runs", headers=_cab(),
-                      params={"maxTotalChargeUsd": MAX_COSTE_USD}, json=entrada, timeout=60)
-    if r.status_code in (401, 403):
-        raise ApifyError("Apify rechazó el token (revisa el secret APIFY_TOKEN).")
-    if r.status_code == 402:
-        raise ApifyError("Apify dice que no queda crédito en tu cuenta.")
-    r.raise_for_status()
-    run = r.json()["data"]
-    print(f"Run de Apify lanzado: {run['id']}")
-
-    fin, estado = time.time() + 15 * 60, "RUNNING"
-    datos = run
-    while time.time() < fin:
-        datos = requests.get(f"{API}/actor-runs/{run['id']}", headers=_cab(), timeout=30).json()["data"]
-        estado = datos["status"]
-        if estado in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"):
-            break
-        time.sleep(10)
-    print(f"Estado final del run: {estado}")
-
-    items = requests.get(f"{API}/datasets/{datos['defaultDatasetId']}/items", headers=_cab(),
-                         params={"format": "json", "clean": "true"}, timeout=60).json()
-    if not isinstance(items, list):
-        items = []
-    if not items and estado != "SUCCEEDED":
-        raise ApifyError(f"El scraper terminó con estado {estado} y sin datos.")
-    # Algunos anuncios no tienen idioma etiquetado: si el filtro deja 0, repetir sin él
-    if not items and con_idioma:
-        print("Sin resultados con filtro de idioma; reintento sin filtro")
-        return lanzar_scraper(con_idioma=False)
-    return items
+# Si el vídeo lleva alguno de estos hashtags, es publicidad/colaboración
+TAGS_PUBLI = {
+    "ad", "ads", "publi", "publicidad", "sponsored", "patrocinado",
+    "colaboracion", "colab", "anuncio", "paidpartnership", "gifted",
+}
+# Hashtags demasiado genéricos para usarlos como "nombre de producto" (modo sin IA)
+TAGS_GENERICOS = {
+    "fyp", "foryou", "foryoupage", "parati", "viral", "tiktok", "trend",
+    "tiktokmademebuyit", "tiktokmehizocomprarlo", "productoviral",
+    "comprastiktok", "amazonfinds", "gadgetsutiles", "hogarutil",
+    "cosasdealiexpress", "cosasutiles", "descubrimientostiktok", "espana",
+    "spain", "madrid", "barcelona", "amazon", "aliexpress", "shein", "temu",
+    "review", "unboxing", "haul", "oferta", "chollo", "chollos", "tiktokshop",
+}
+IDIOMAS_OK = {"es", "ca", "gl", "eu", "un", "und", "", None}
 
 
-# ───────────────────────── tratamiento de anuncios ─────────────────────────
-def limpiar_url(url: str) -> tuple[str, str]:
-    """Devuelve (clave del producto, url sin parámetros de seguimiento)."""
-    p = urlparse(url)
-    host = p.netloc.lower().removeprefix("www.")
-    ruta = p.path.rstrip("/")
-    return f"{host}{ruta}", f"{p.scheme}://{p.netloc}{p.path}" if p.netloc else ""
+# ---------------------------------------------------------------- UTILIDADES
+def _env(*nombres, default=""):
+    for n in nombres:
+        v = os.getenv(n)
+        if v:
+            return v
+    return default
 
 
-def termino_busqueda(anuncio: dict) -> str:
-    """Término para buscar el producto: slug de la URL o primeras palabras del texto."""
-    url = anuncio.get("landingPageUrl") or ""
-    segs = [s for s in urlparse(url).path.split("/") if s]
-    slug = ""
-    if "products" in segs and segs.index("products") + 1 < len(segs):
-        slug = segs[segs.index("products") + 1]
-    elif segs and re.fullmatch(r"[a-zA-Z\-]{6,}", segs[-1]):
-        slug = segs[-1]
-    fuente = slug.replace("-", " ") if slug else re.sub(r"[#@]\S+", " ", anuncio.get("adCaption") or "")
-    palabras = [w for w in re.sub(r"[^\w\s]", " ", fuente).split()
-                if len(w) > 2 and not any(c.isdigit() for c in w) and w.lower() not in STOPWORDS]
-    return " ".join(palabras[:4])
-
-
-def agrupar(items: list[dict], filtro: str = "") -> list[dict]:
-    """Agrupa anuncios por producto (misma página de venta) y los ordena."""
-    grupos: dict[str, list[dict]] = {}
-    for a in items:
-        url = a.get("landingPageUrl") or ""
-        if any(h in url.lower() for h in HOSTS_NO_PRODUCTO):
-            continue  # apps, redes sociales...: no son productos
-        clave = limpiar_url(url)[0] if url else f"sin-url-{a.get('adId')}"
-        if filtro:
-            texto = " ".join(str(a.get(k) or "") for k in ("adCaption", "advertiserName", "brandName")) + " " + url
-            if normalizar(filtro) not in normalizar(texto):
-                continue
-        grupos.setdefault(clave, []).append(a)
-
-    productos = []
-    for clave, anuncios in grupos.items():
-        mejor = max(anuncios, key=lambda a: (a.get("ctr") or 0, a.get("likes") or 0))
-        productos.append({"clave": clave, "anuncios": anuncios, "mejor": mejor,
-                          "n": len(anuncios), "ctr": mejor.get("ctr") or 0,
-                          "likes": max((a.get("likes") or 0) for a in anuncios)})
-    productos.sort(key=lambda p: (p["n"], p["ctr"], p["likes"]), reverse=True)
-    return productos
-
-
-def normalizar(t: str) -> str:
-    import unicodedata
-    t = unicodedata.normalize("NFKD", t)
-    return "".join(c for c in t if not unicodedata.combining(c)).lower()
-
-
-# ───────────────────────── mensaje ─────────────────────────
-def abreviar(n) -> str:
+def _num(x):
     try:
-        n = float(n)
+        return int(x or 0)
     except (TypeError, ValueError):
-        return "-"
-    return f"{n/1000:.1f}K" if n >= 1000 else f"{n:g}"
+        return 0
 
 
-def enlaces(term: str) -> str:
-    q = quote_plus(term)
-    e = lambda u: html.escape(u, quote=True)
-    tiktok = f"https://www.tiktok.com/search/video?q={q}"
-    insta = "https://www.google.com/search?q=" + quote_plus(f"site:instagram.com/reel {term}")
-    trends = f"https://trends.google.es/trends/explore?geo=ES&q={q}"
-    ali = f"https://es.aliexpress.com/wholesale?SearchText={q}"
-    return (f'🎵 <a href="{e(tiktok)}">TikTok</a>  ·  📸 <a href="{e(insta)}">Instagram</a>  ·  '
-            f'📊 <a href="{e(trends)}">Trends</a>  ·  🛒 <a href="{e(ali)}">AliExpress</a>')
+def _sin_acentos(s):
+    s = unicodedata.normalize("NFD", s or "")
+    return "".join(c for c in s if unicodedata.category(c) != "Mn").lower().strip()
 
 
-def formatear(productos: list[dict]) -> str:
-    out = ["🏆 <b>Productos ganadores · anuncios top de TikTok España</b>",
-           f"<i>Ranking de los últimos {PERIODO} días · ordenados por nº de anuncios y CTR</i>"]
-    for i, p in enumerate(productos[:TOP], 1):
-        a = p["mejor"]
-        marca = a.get("brandName") or a.get("advertiserName") or "Anunciante"
-        caption = re.sub(r"\s+", " ", a.get("adCaption") or "").strip()
-        caption = html.escape(caption[:110] + ("…" if len(caption) > 110 else ""))
-        term = termino_busqueda(a) or marca
-        url_prod = limpiar_url(a.get("landingPageUrl") or "")[1]
-
-        out += ["", "━━━━━━━━━━━━", f"<b>{i}. {html.escape(str(marca))}</b>"]
-        if a.get("industry"):
-            out[-1] += f"  <i>({html.escape(str(a['industry']))})</i>"
-        if caption:
-            out.append(f"“{caption}”")
-        datos = []
-        if p["n"] > 1:
-            datos.append(f"🔥 {p['n']} anuncios")
-        datos.append(f"📈 CTR {a.get('ctr', '-')}")
-        datos.append(f"❤️ {abreviar(p['likes'])}")
-        out.append("  ·  ".join(datos))
-        botones = []
-        if a.get("adUrl"):
-            botones.append(f'🎬 <a href="{html.escape(a["adUrl"], quote=True)}">Ver anuncio</a>')
-        if url_prod:
-            botones.append(f'🛍 <a href="{html.escape(url_prod, quote=True)}">Página de venta</a>')
-        if botones:
-            out.append("  ·  ".join(botones))
-        if term:
-            out.append(enlaces(term))
-    return "\n".join(out)
+def _hashtags(v):
+    salida = []
+    for h in v.get("hashtags") or []:
+        n = h.get("name") if isinstance(h, dict) else h
+        if n:
+            salida.append(_sin_acentos(str(n)))
+    return salida
 
 
-# ───────────────────────── Telegram ─────────────────────────
-def trocear(texto: str, limite: int = 3800) -> list[str]:
-    partes, actual = [], ""
-    for linea in texto.split("\n"):
-        if len(actual) + len(linea) + 1 > limite:
-            partes.append(actual)
-            actual = ""
-        actual += linea + "\n"
-    if actual.strip():
-        partes.append(actual)
-    return partes
+def _fecha(v):
+    iso = v.get("createTimeISO")
+    if iso:
+        try:
+            return datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        except ValueError:
+            pass
+    ts = v.get("createTime")
+    if ts:
+        try:
+            return datetime.fromtimestamp(int(ts), tz=timezone.utc)
+        except (TypeError, ValueError, OSError):
+            pass
+    return None
 
 
-def enviar(texto: str, html_mode: bool = True) -> None:
-    url = f"https://api.telegram.org/bot{os.environ['TELEGRAM_TOKEN']}/sendMessage"
-    for parte in trocear(texto):
-        datos = {"chat_id": os.environ["TELEGRAM_CHAT_ID"], "text": parte,
-                 "disable_web_page_preview": True}
-        if html_mode:
-            datos["parse_mode"] = "HTML"
-        requests.post(url, json=datos, timeout=30).raise_for_status()
+# ---------------------------------------------------------------- 1) RECOGER
+def recoger_videos(palabra=""):
+    token = _env("APIFY_TOKEN", "APIFY_API_TOKEN")
+    if not token:
+        raise SystemExit("Falta el secret APIFY_TOKEN")
+    client = ApifyClient(token)
 
+    busquedas = list(BUSQUEDAS)
+    if palabra:
+        busquedas += [f"{palabra} viral", f"{palabra} me compré", f"{palabra} producto"]
 
-# ───────────────────────── programa principal ─────────────────────────
-def main() -> int:
-    filtro = os.environ.get("FILTRO", "").strip()
+    run_input = {
+        "hashtags": HASHTAGS,
+        "searchQueries": busquedas,
+        "resultsPerPage": VIDEOS_POR_TERMINO,
+        "shouldDownloadVideos": False,
+        "shouldDownloadCovers": False,
+        "shouldDownloadSubtitles": False,
+        "proxyCountryCode": "ES",
+    }
     try:
-        items = lanzar_scraper()
-    except ApifyError as e:
-        enviar(f"⚠️ Radar: {e}", html_mode=False)
-        print(e, file=sys.stderr)
-        return 1
-
-    print(f"Anuncios recibidos: {len(items)}")
-    productos = agrupar(items, filtro)
-    if not productos:
-        enviar("⚠️ El radar no encontró anuncios de producto esta vez"
-               + (f" con la palabra «{filtro}»" if filtro else "")
-               + ". Prueba otra vez o amplía las industrias en productos.py.", html_mode=False)
-        return 1
-    enviar(formatear(productos))
-    print(f"Enviados {min(TOP, len(productos))} productos")
-    return 0
+        run = client.actor(ACTOR).call(run_input=run_input)
+    except Exception as e:  # por si el actor no acepta proxyCountryCode
+        print(f"Apify falló con proxyCountryCode ({e}); reintento sin él")
+        run_input.pop("proxyCountryCode", None)
+        run = client.actor(ACTOR).call(run_input=run_input)
+    return list(client.dataset(run["defaultDatasetId"]).iterate_items())
 
 
-if __name__ == "__main__":
+# ---------------------------------------------------------------- 2) FILTRAR Y PUNTUAR
+def _es_anuncio(v):
+    if v.get("isAd") or v.get("isSponsored"):
+        return True
+    if set(_hashtags(v)) & TAGS_PUBLI:
+        return True
+    texto = _sin_acentos(v.get("text", ""))
+    return bool(re.search(r"#(ad|publi|sponsored|patrocinado)\b|paid partnership", texto))
+
+
+def _metricas(v):
+    vistas = max(_num(v.get("playCount")), 1)
+    likes = _num(v.get("diggCount"))
+    coment = _num(v.get("commentCount"))
+    shares = _num(v.get("shareCount"))
+    guard = _num(v.get("collectCount"))
+    seguidores = _num((v.get("authorMeta") or {}).get("fans"))
+
+    inter = (likes + coment + shares + guard) / vistas            # para mostrar
+    inter_pond = (likes + coment + 2 * shares + 2 * guard) / vistas  # shares/guardados pesan doble
+    viral = min(vistas / max(seguidores, 100), 50)                # vistas vs tamaño de la cuenta
+    return {
+        "vistas": vistas, "likes": likes, "coment": coment,
+        "shares": shares, "guardados": guard, "seguidores": seguidores,
+        "inter": inter, "viral": viral,
+        "score": inter_pond * 100 + viral * 0.5,
+    }
+
+
+def filtrar_y_puntuar(items):
+    limite = datetime.now(timezone.utc) - timedelta(days=DIAS_MAX)
+    vistos, salida = set(), []
+    for v in items:
+        vid = v.get("id") or v.get("webVideoUrl")
+        if not vid or vid in vistos:
+            continue
+        vistos.add(vid)
+        if _es_anuncio(v):
+            continue
+        f = _fecha(v)
+        if f is None or f < limite:
+            continue
+        if v.get("textLanguage") not in IDIOMAS_OK:
+            continue
+        m = _metricas(v)
+        if m["vistas"] < MIN_VISTAS:
+            continue
+        salida.append((v, m))
+    salida.sort(key=lambda x: x[1]["score"], reverse=True)
+    return salida[:MAX_VIDEOS_A_IA]
+
+
+# ---------------------------------------------------------------- 3) PRODUCTO (IA)
+def _extraer_con_ia(videos):
+    """Devuelve {indice: {producto, categoria, problema}} o None si no hay IA."""
+    clave = _env("ANTHROPIC_API_KEY")
+    if not clave:
+        return None
+    modelo = _env("ANTHROPIC_MODEL", default="claude-haiku-5-5")
+
+    lineas = []
+    for i, (v, _) in enumerate(videos):
+        tags = " ".join("#" + t for t in _hashtags(v)[:8])
+        texto = (v.get("text") or "").replace("\n", " ")[:220]
+        lineas.append(f"{i}. {texto} {tags}")
+
+    prompt = (
+        "Estos son vídeos orgánicos de TikTok España. Para cada uno identifica el "
+        "PRODUCTO FÍSICO que se muestra o recomienda.\n"
+        "Devuelve SOLO un JSON (lista) con objetos "
+        '{"i": número, "producto": "nombre genérico en español, minúsculas, 2-4 palabras", '
+        '"categoria": "una palabra", "problema": "qué problema resuelve, máx 10 palabras"}.\n'
+        "Si el vídeo NO vende/recomienda un producto físico (humor, receta, servicio, app, "
+        "famoso, marca grande como Apple/Nike/Dyson, medicamento o suplemento), "
+        'pon "producto": null. Usa el MISMO nombre para el mismo producto en distintos vídeos.\n\n'
+        + "\n".join(lineas)
+    )
     try:
-        sys.exit(main())
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": clave,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={"model": modelo, "max_tokens": 4000,
+                  "messages": [{"role": "user", "content": prompt}]},
+            timeout=120,
+        )
+        r.raise_for_status()
+        texto = r.json()["content"][0]["text"]
+        datos = json.loads(texto[texto.find("["): texto.rfind("]") + 1])
+        return {int(d["i"]): d for d in datos if d.get("producto")}
     except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+        print(f"IA no disponible ({e}); uso hashtags como alternativa")
+        return None
+
+
+def _nombre_sin_ia(v):
+    for t in _hashtags(v):
+        if t not in TAGS_GENERICOS and t not in TAGS_PUBLI and len(t) > 3:
+            return t
+    return None
+
+
+# ---------------------------------------------------------------- 4) AGRUPAR
+def _enlaces(nombre):
+    q = quote_plus(nombre)
+    return {
+        "aliexpress": f"https://es.aliexpress.com/wholesale?SearchText={q}",
+        "trends": f"https://trends.google.es/trends/explore?date=today%203-m&geo=ES&q={q}",
+        "tiktok": f"https://www.tiktok.com/search?q={q}",
+    }
+
+
+def agrupar(videos):
+    ia = _extraer_con_ia(videos)
+    grupos = {}
+    for i, (v, m) in enumerate(videos):
+        if ia is not None:
+            d = ia.get(i)
+            if not d:
+                continue
+            nombre = str(d["producto"]).strip()
+            cat, prob = d.get("categoria", ""), d.get("problema", "")
+        else:
+            nombre = _nombre_sin_ia(v)
+            cat = prob = ""
+            if not nombre:
+                continue
+        g = grupos.setdefault(
+            _sin_acentos(nombre),
+            {"nombre": nombre, "categoria": cat, "problema": prob, "videos": []},
+        )
+        g["videos"].append((v, m))
+
+    resultado = []
+    for g in grupos.values():
+        mejor_por_creador = {}
+        for v, m in g["videos"]:
+            autor = (v.get("authorMeta") or {}).get("name") or v.get("id")
+            if autor not in mejor_por_creador or m["score"] > mejor_por_creador[autor][1]["score"]:
+                mejor_por_creador[autor] = (v, m)
+        mejor = max(mejor_por_creador.values(), key=lambda x: x[1]["score"])
+        g["creadores"] = len(mejor_por_creador)
+        g["vistas"] = sum(m["vistas"] for _, m in g["videos"])
+        g["inter"] = sum(m["inter"] for _, m in g["videos"]) / len(g["videos"])
+        g["score"] = sum(m["score"] for _, m in mejor_por_creador.values())
+        g["url"] = mejor[0].get("webVideoUrl", "")
+        g.update(_enlaces(g["nombre"]))
+        resultado.append(g)
+    resultado.sort(key=lambda g: g["score"], reverse=True)
+    return resultado
+
+
+# ---------------------------------------------------------------- API PRINCIPAL
+def buscar(palabra=""):
+    palabra = (palabra or "").strip()
+    items = recoger_videos(palabra)
+    print(f"Apify devolvió {len(items)} vídeos")
+    videos = filtrar_y_puntuar(items)
+    print(f"Tras filtrar anuncios/antiguos/poco alcance: {len(videos)}")
+    grupos = agrupar(videos)
+    if palabra:
+        p = _sin_acentos(palabra)
+        grupos = [g for g in grupos if p in _sin_acentos(g["nombre"] + " " + g["categoria"])]
+    return grupos[:TOP_PRODUCTOS]
