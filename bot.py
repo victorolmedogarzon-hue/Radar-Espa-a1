@@ -31,7 +31,7 @@ def _bloque(i, g):
     if g["problema"]:
         lineas.append(f"💡 {esc(g['problema'])}")
     if not g.get("estricto", True):
-        lineas.append("⚠️ Señal más débil (vídeo más antiguo o con menos vistas)")
+        lineas.append("⚠️ Señal más débil (vídeo más antiguo, con menos vistas o producto poco claro)")
     lineas.append(
         f"👥 {g['creadores']} creador(es) · 👁 {_fmt(g['vistas'])} vistas · "
         f"📈 {g['inter'] * 100:.1f}% interacción"
