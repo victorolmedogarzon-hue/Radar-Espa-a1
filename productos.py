@@ -1,267 +1,205 @@
 """
-Radar de productos GRATIS (Amazon.es) con enlaces para validar en Meta, TikTok,
-Instagram y Google Trends.
+Radar de productos ganadores: anuncios TOP de TikTok en España.
 
-Tres formas de usarlo:
-  1) Cada lunes: informe automático con los nichos por defecto.
-  2) A mano desde GitHub Actions: "Run workflow" escribiendo un nicho.
-  3) Desde Telegram: escribes al bot un nicho (ej. "perros" o "/nicho masajeador cervical")
-     y el bot te responde en unos minutos.
+Usa el scraper de Apify "scrapesage/tiktok-ad-library-scraper" (fuente Creative Center
+Top Ads), saca la página de venta de cada anuncio, agrupa por producto y manda a Telegram
+los más repetidos / con mejor CTR, con enlaces para validarlos.
+
+Necesita los secrets: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID y APIFY_TOKEN.
 """
 import html
 import os
-import random
 import re
 import sys
 import time
-import unicodedata
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 
 import requests
-from bs4 import BeautifulSoup
 
-CRON_SEMANAL = "0 8 * * 1"  # tiene que coincidir con el cron semanal de radar.yml
-NICHOS_POR_DEFECTO = ["hogar", "belleza", "mascotas", "gadgets"]
-TOP = 6  # productos por lista
+# ───────────────────────── AJUSTES (puedes editarlos) ─────────────────────────
+ACTOR = "scrapesage~tiktok-ad-library-scraper"
+PAIS = "ES"
+PERIODO = "30"            # días del ranking: "7", "30" o "180"
+INDUSTRIAS = [            # si TikTok no reconoce un nombre, simplemente lo salta
+    "E-commerce", "Beauty & Personal Care", "Household Products", "Home Improvement",
+    "Health", "Pets", "Sports & Outdoor", "Tech & Electronics",
+]
+MAX_ANUNCIOS = 60         # tope de anuncios por ejecución (controla el gasto)
+MAX_COSTE_USD = 1.0       # tope de gasto por ejecución en Apify
+TOP = 10                  # productos que se mandan a Telegram
 
-# Filtros pensados para dropshipping ORGÁNICO (vídeos en TikTok/Reels):
-# producto barato, de compra por impulso, sin consumibles ni marcas de supermercado.
-PRECIO_MIN, PRECIO_MAX = 8.0, 60.0
-EXCLUIR = (
-    "comida", "pienso", "alimento", "snack", "croqueta", "arena para", "arenero",
-    "panal", "toallita", "champu", "gel de ducha", "detergente", "suavizante",
-    "papel higienico", "bolsas de basura", "bolsa de basura", "pilas", "cartucho",
-    "tinta", "cafe", "capsula", "vitamina", "suplemento", "proteina", "leche",
-    "galleta", "te verde", "infusion", "colonia", "perfume", "libro", "cable usb",
-    "protector de pantalla", "funda para", "recambio", "refill",
-)
-
-# Nichos que coinciden con una categoría de Amazon (ranking oficial).
-# Cualquier otro texto se busca directamente en Amazon.
-_CATS = {
-    ("hogar", "cocina", "hogar y cocina", "casa"): ("🏠 Hogar y cocina", "kitchen"),
-    ("belleza", "cosmetica", "maquillaje"): ("💄 Belleza", "beauty"),
-    ("mascotas", "mascota", "perros", "gatos"): ("🐶 Mascotas", "pet-supplies"),
-    ("gadgets", "electronica", "tecnologia"): ("🔌 Electrónica y gadgets", "electronics"),
-    ("deporte", "deportes", "fitness"): ("🏋️ Deportes", "sports"),
-    ("juguetes", "juegos"): ("🧸 Juguetes", "toys"),
-    ("bebe", "bebes"): ("🍼 Bebé", "baby"),
-    ("jardin", "exterior"): ("🌿 Jardín", "lawn-garden"),
-    ("bricolaje", "herramientas"): ("🔧 Bricolaje", "diy"),
-    ("salud", "bienestar"): ("💊 Salud y bienestar", "hpc"),
-    ("oficina", "papeleria"): ("📎 Oficina", "office-products"),
-}
-CATEGORIAS = {alias: v for claves, v in _CATS.items() for alias in claves}
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "es-ES,es;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-}
-ASIN_RE = re.compile(r"/dp/([A-Z0-9]{10})")
-STOPWORDS = {"de", "del", "la", "el", "los", "las", "y", "con", "sin", "para", "en",
-             "un", "una", "por", "a", "al", "o", "e", "x"}
+API = "https://api.apify.com/v2"
+STOPWORDS = {"de", "del", "la", "el", "los", "las", "y", "con", "sin", "para", "en", "un",
+             "una", "por", "a", "al", "o", "e", "the", "and", "for", "with", "your", "you"}
+HOSTS_NO_PRODUCTO = ("apps.apple.com", "play.google.com", "tiktok.com", "instagram.com",
+                     "facebook.com", "wa.me", "t.me")
 
 
-# ───────────────────────── utilidades ─────────────────────────
-def normalizar(texto: str) -> str:
-    t = unicodedata.normalize("NFKD", texto)
-    return "".join(c for c in t if not unicodedata.combining(c)).lower().strip()
+# ───────────────────────── Apify ─────────────────────────
+class ApifyError(Exception):
+    pass
 
 
-def pausa() -> None:
-    time.sleep(random.uniform(2, 4))  # para no parecer un robot
+def _cab() -> dict:
+    return {"Authorization": f"Bearer {os.environ['APIFY_TOKEN']}"}
 
 
-def descargar(url: str) -> BeautifulSoup | None:
-    for intento in range(2):
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=30)
-        except requests.RequestException:
-            r = None
-        if r is not None and r.status_code == 200 and "validateCaptcha" not in r.text:
-            print(f"OK {r.status_code}: {url}")
-            return BeautifulSoup(r.text, "html.parser")
-        motivo = "sin respuesta" if r is None else (
-            "captcha" if r.status_code == 200 else f"HTTP {r.status_code}")
-        print(f"FALLO ({motivo}): {url}")
-        time.sleep(3)
-    return None
+def lanzar_scraper(con_idioma: bool = True) -> list[dict]:
+    entrada = {
+        "source": "creative-center",
+        "countryCodes": [PAIS],
+        "period": PERIODO,
+        "orderBy": "ctr",
+        "industries": INDUSTRIAS,
+        "includeAdDetails": True,   # necesario para obtener la página de venta
+        "includeVideoUrl": False,
+        "maxResults": MAX_ANUNCIOS,
+    }
+    if con_idioma:
+        entrada["adLanguages"] = ["es"]
+
+    r = requests.post(f"{API}/acts/{ACTOR}/runs", headers=_cab(),
+                      params={"maxTotalChargeUsd": MAX_COSTE_USD}, json=entrada, timeout=60)
+    if r.status_code in (401, 403):
+        raise ApifyError("Apify rechazó el token (revisa el secret APIFY_TOKEN).")
+    if r.status_code == 402:
+        raise ApifyError("Apify dice que no queda crédito en tu cuenta.")
+    r.raise_for_status()
+    run = r.json()["data"]
+    print(f"Run de Apify lanzado: {run['id']}")
+
+    fin, estado = time.time() + 15 * 60, "RUNNING"
+    datos = run
+    while time.time() < fin:
+        datos = requests.get(f"{API}/actor-runs/{run['id']}", headers=_cab(), timeout=30).json()["data"]
+        estado = datos["status"]
+        if estado in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"):
+            break
+        time.sleep(10)
+    print(f"Estado final del run: {estado}")
+
+    items = requests.get(f"{API}/datasets/{datos['defaultDatasetId']}/items", headers=_cab(),
+                         params={"format": "json", "clean": "true"}, timeout=60).json()
+    if not isinstance(items, list):
+        items = []
+    if not items and estado != "SUCCEEDED":
+        raise ApifyError(f"El scraper terminó con estado {estado} y sin datos.")
+    # Algunos anuncios no tienen idioma etiquetado: si el filtro deja 0, repetir sin él
+    if not items and con_idioma:
+        print("Sin resultados con filtro de idioma; reintento sin filtro")
+        return lanzar_scraper(con_idioma=False)
+    return items
 
 
-# ───────────────────────── lectura de Amazon ─────────────────────────
-def extraer_ranking(soup: BeautifulSoup, movers: bool) -> list[dict]:
-    """Páginas 'Más vendidos' y 'Los que más suben'."""
-    productos, vistos = [], set()
-    items = soup.select("div#gridItemRoot") or soup.select("div.zg-grid-general-faceout")
-    for it in items:
-        a = it.select_one('a[href*="/dp/"]')
-        m = ASIN_RE.search(a.get("href", "")) if a else None
-        if not m or m.group(1) in vistos:
-            continue
-        asin = m.group(1)
-        t = it.select_one('[class*="line-clamp"]')
-        titulo = t.get_text(" ", strip=True) if t else ""
-        if not titulo:
-            img = it.select_one("img")
-            titulo = (img.get("alt") or "").strip() if img else ""
-        if not titulo:
-            continue
-        precio_el = it.select_one('[class*="price"]')
-        cambio_txt, cambio_num = "", 0
-        if movers:  # el % de subida solo existe en 'Los que más suben'
-            c = it.select_one('[class*="percent-change"]')
-            cambio_txt = c.get_text(strip=True) if c else ""
-            digitos = re.sub(r"[^\d]", "", cambio_txt)
-            cambio_num = int(digitos) if digitos else 0
-        vistos.add(asin)
-        productos.append({
-            "asin": asin, "titulo": titulo,
-            "precio": precio_el.get_text(strip=True) if precio_el else "",
-            "cambio": cambio_txt, "cambio_num": cambio_num,
-            "url": f"https://www.amazon.es/dp/{asin}",
-        })
+# ───────────────────────── tratamiento de anuncios ─────────────────────────
+def limpiar_url(url: str) -> tuple[str, str]:
+    """Devuelve (clave del producto, url sin parámetros de seguimiento)."""
+    p = urlparse(url)
+    host = p.netloc.lower().removeprefix("www.")
+    ruta = p.path.rstrip("/")
+    return f"{host}{ruta}", f"{p.scheme}://{p.netloc}{p.path}" if p.netloc else ""
+
+
+def termino_busqueda(anuncio: dict) -> str:
+    """Término para buscar el producto: slug de la URL o primeras palabras del texto."""
+    url = anuncio.get("landingPageUrl") or ""
+    segs = [s for s in urlparse(url).path.split("/") if s]
+    slug = ""
+    if "products" in segs and segs.index("products") + 1 < len(segs):
+        slug = segs[segs.index("products") + 1]
+    elif segs and re.fullmatch(r"[a-zA-Z\-]{6,}", segs[-1]):
+        slug = segs[-1]
+    fuente = slug.replace("-", " ") if slug else re.sub(r"[#@]\S+", " ", anuncio.get("adCaption") or "")
+    palabras = [w for w in re.sub(r"[^\w\s]", " ", fuente).split()
+                if len(w) > 2 and not any(c.isdigit() for c in w) and w.lower() not in STOPWORDS]
+    return " ".join(palabras[:4])
+
+
+def agrupar(items: list[dict], filtro: str = "") -> list[dict]:
+    """Agrupa anuncios por producto (misma página de venta) y los ordena."""
+    grupos: dict[str, list[dict]] = {}
+    for a in items:
+        url = a.get("landingPageUrl") or ""
+        if any(h in url.lower() for h in HOSTS_NO_PRODUCTO):
+            continue  # apps, redes sociales...: no son productos
+        clave = limpiar_url(url)[0] if url else f"sin-url-{a.get('adId')}"
+        if filtro:
+            texto = " ".join(str(a.get(k) or "") for k in ("adCaption", "advertiserName", "brandName")) + " " + url
+            if normalizar(filtro) not in normalizar(texto):
+                continue
+        grupos.setdefault(clave, []).append(a)
+
+    productos = []
+    for clave, anuncios in grupos.items():
+        mejor = max(anuncios, key=lambda a: (a.get("ctr") or 0, a.get("likes") or 0))
+        productos.append({"clave": clave, "anuncios": anuncios, "mejor": mejor,
+                          "n": len(anuncios), "ctr": mejor.get("ctr") or 0,
+                          "likes": max((a.get("likes") or 0) for a in anuncios)})
+    productos.sort(key=lambda p: (p["n"], p["ctr"], p["likes"]), reverse=True)
     return productos
 
 
-def extraer_busqueda(soup: BeautifulSoup) -> list[dict]:
-    """Resultados de búsqueda de Amazon (sin anuncios patrocinados)."""
-    productos, vistos = [], set()
-    for it in soup.select('div[data-component-type="s-search-result"]'):
-        asin = (it.get("data-asin") or "").strip()
-        if not asin or asin in vistos:
-            continue
-        if it.select_one('.puis-sponsored-label-text, [class*="sponsored-label"]'):
-            continue
-        h2 = it.select_one("h2")
-        titulo = h2.get_text(" ", strip=True) if h2 else ""
-        if not titulo:
-            continue
-        precio_el = it.select_one("span.a-price span.a-offscreen")
-        vistos.add(asin)
-        productos.append({
-            "asin": asin, "titulo": titulo,
-            "precio": precio_el.get_text(strip=True) if precio_el else "",
-            "cambio": "", "cambio_num": 0,
-            "url": f"https://www.amazon.es/dp/{asin}",
-        })
-    return productos
+def normalizar(t: str) -> str:
+    import unicodedata
+    t = unicodedata.normalize("NFKD", t)
+    return "".join(c for c in t if not unicodedata.combining(c)).lower()
 
 
-def precio_num(texto: str) -> float | None:
-    m = re.search(r"\d[\d.,]*", texto or "")
-    if not m:
-        return None
-    n = m.group(0)
-    n = n.replace(".", "").replace(",", ".") if "," in n else n
+# ───────────────────────── mensaje ─────────────────────────
+def abreviar(n) -> str:
     try:
-        return float(n)
-    except ValueError:
-        return None
+        n = float(n)
+    except (TypeError, ValueError):
+        return "-"
+    return f"{n/1000:.1f}K" if n >= 1000 else f"{n:g}"
 
 
-def apto_organico(p: dict) -> bool:
-    titulo = normalizar(p["titulo"])
-    if any(x in titulo for x in EXCLUIR):
-        return False
-    precio = precio_num(p["precio"])
-    return precio is None or PRECIO_MIN <= precio <= PRECIO_MAX
-
-
-def filtrar(prods: list[dict]) -> list[dict]:
-    aptos = [p for p in prods if apto_organico(p)]
-    return aptos if len(aptos) >= 3 else prods  # si el filtro deja muy poco, no se aplica
-
-
-def recoger(nicho: str) -> tuple[str, list[tuple[str, list[dict]]]]:
-    """Devuelve (título del nicho, [(nombre de lista, productos)])."""
-    cat = CATEGORIAS.get(normalizar(nicho))
-    secciones = []
-    if cat:
-        nombre, slug = cat
-        for etiqueta, ruta, movers in (
-            ("🚀 Los que más suben", "movers-and-shakers", True),
-            ("🆕 Novedades que despegan", "new-releases", False),
-        ):
-            soup = descargar(f"https://www.amazon.es/gp/{ruta}/{slug}")
-            pausa()
-            prods = extraer_ranking(soup, movers) if soup else []
-            print(f"{etiqueta} «{nicho}»: {len(prods)} productos leídos")
-            if movers:
-                prods.sort(key=lambda p: p["cambio_num"], reverse=True)
-            prods = filtrar(prods)
-            if prods:
-                secciones.append((etiqueta, prods[:TOP]))
-    else:
-        nombre = f"🔎 {nicho.strip().capitalize()}"
-    if not secciones:  # nicho libre, o la categoría falló: buscar en Amazon
-        url = f"https://www.amazon.es/s?k={quote_plus(nicho)}&s=exact-aware-popularity-rank"
-        soup = descargar(url)
-        pausa()
-        prods = filtrar(extraer_busqueda(soup)) if soup else []
-        print(f"Búsqueda «{nicho}»: {len(prods)} productos leídos")
-        if prods:
-            secciones.append(("🏅 Más populares en Amazon", prods[:TOP]))
-    return nombre, secciones
-
-
-# ───────────────────────── enlaces de validación ─────────────────────────
-def termino(titulo: str, palabras: int = 3) -> str:
-    """Saca un término de búsqueda limpio del título de Amazon."""
-    t = re.sub(r"(?i)\bby amazon\b|\bamazon basics\b", " ", titulo)
-    t = re.split(r"\s[-–|]\s|[,(|]", t)[0]
-    util = []
-    for w in re.sub(r"[^\w\s]", " ", t).split():
-        if any(ch.isdigit() for ch in w) or len(w) < 2 or w.lower() in STOPWORDS:
-            continue
-        util.append(w)
-    return " ".join(util[:palabras]) or " ".join(titulo.split()[:3])
-
-
-def enlaces(titulo: str) -> str:
-    t = termino(titulo)
-    q = quote_plus(t)
+def enlaces(term: str) -> str:
+    q = quote_plus(term)
+    e = lambda u: html.escape(u, quote=True)
     tiktok = f"https://www.tiktok.com/search/video?q={q}"
-    # Instagram no tiene búsqueda de vídeos por palabra: se usa Google sobre sus reels
-    insta = "https://www.google.com/search?q=" + quote_plus(f"site:instagram.com/reel {t}")
+    insta = "https://www.google.com/search?q=" + quote_plus(f"site:instagram.com/reel {term}")
     trends = f"https://trends.google.es/trends/explore?geo=ES&q={q}"
     ali = f"https://es.aliexpress.com/wholesale?SearchText={q}"
-    meta = ("https://www.facebook.com/ads/library/?active_status=active&ad_type=all"
-            f"&country=ES&q={q}&search_type=keyword_unordered")
-    e = lambda u: html.escape(u, quote=True)
     return (f'🎵 <a href="{e(tiktok)}">TikTok</a>  ·  📸 <a href="{e(insta)}">Instagram</a>  ·  '
-            f'📊 <a href="{e(trends)}">Trends</a>\n'
-            f'    🛒 <a href="{e(ali)}">AliExpress</a>  ·  📢 <a href="{e(meta)}">Meta</a>')
+            f'📊 <a href="{e(trends)}">Trends</a>  ·  🛒 <a href="{e(ali)}">AliExpress</a>')
 
 
-# ───────────────────────── formato del mensaje ─────────────────────────
-def formatear(nombre: str, secciones: list[tuple[str, list[dict]]]) -> str:
-    out = [f"<b>{html.escape(nombre)}</b>", "<i>Ideas para dropshipping orgánico · valida en TikTok/Reels antes de elegir</i>"]
-    for etiqueta, prods in secciones:
-        out += ["", f"<b>{etiqueta}</b>", "━━━━━━━━━━━━"]
-        for i, p in enumerate(prods, 1):
-            titulo = html.escape(p["titulo"][:60] + ("…" if len(p["titulo"]) > 60 else ""))
-            datos = []
-            if p["precio"]:
-                datos.append(f"💶 {html.escape(p['precio'])}")
-            if p["cambio"]:
-                datos.append(f"📈 {html.escape(p['cambio'])}")
-            out.append(f'<b>{i}.</b> <a href="{p["url"]}">{titulo}</a>')
-            if datos:
-                out.append("    " + "  ·  ".join(datos))
-            out.append("    " + enlaces(p["titulo"]))
-            out.append("")
-    return "\n".join(out).strip()
+def formatear(productos: list[dict]) -> str:
+    out = ["🏆 <b>Productos ganadores · anuncios top de TikTok España</b>",
+           f"<i>Ranking de los últimos {PERIODO} días · ordenados por nº de anuncios y CTR</i>"]
+    for i, p in enumerate(productos[:TOP], 1):
+        a = p["mejor"]
+        marca = a.get("brandName") or a.get("advertiserName") or "Anunciante"
+        caption = re.sub(r"\s+", " ", a.get("adCaption") or "").strip()
+        caption = html.escape(caption[:110] + ("…" if len(caption) > 110 else ""))
+        term = termino_busqueda(a) or marca
+        url_prod = limpiar_url(a.get("landingPageUrl") or "")[1]
+
+        out += ["", "━━━━━━━━━━━━", f"<b>{i}. {html.escape(str(marca))}</b>"]
+        if a.get("industry"):
+            out[-1] += f"  <i>({html.escape(str(a['industry']))})</i>"
+        if caption:
+            out.append(f"“{caption}”")
+        datos = []
+        if p["n"] > 1:
+            datos.append(f"🔥 {p['n']} anuncios")
+        datos.append(f"📈 CTR {a.get('ctr', '-')}")
+        datos.append(f"❤️ {abreviar(p['likes'])}")
+        out.append("  ·  ".join(datos))
+        botones = []
+        if a.get("adUrl"):
+            botones.append(f'🎬 <a href="{html.escape(a["adUrl"], quote=True)}">Ver anuncio</a>')
+        if url_prod:
+            botones.append(f'🛍 <a href="{html.escape(url_prod, quote=True)}">Página de venta</a>')
+        if botones:
+            out.append("  ·  ".join(botones))
+        if term:
+            out.append(enlaces(term))
+    return "\n".join(out)
 
 
 # ───────────────────────── Telegram ─────────────────────────
-def _api(metodo: str) -> str:
-    return f"https://api.telegram.org/bot{os.environ['TELEGRAM_TOKEN']}/{metodo}"
-
-
 def trocear(texto: str, limite: int = 3800) -> list[str]:
     partes, actual = [], ""
     for linea in texto.split("\n"):
@@ -275,88 +213,35 @@ def trocear(texto: str, limite: int = 3800) -> list[str]:
 
 
 def enviar(texto: str, html_mode: bool = True) -> None:
+    url = f"https://api.telegram.org/bot{os.environ['TELEGRAM_TOKEN']}/sendMessage"
     for parte in trocear(texto):
         datos = {"chat_id": os.environ["TELEGRAM_CHAT_ID"], "text": parte,
                  "disable_web_page_preview": True}
         if html_mode:
             datos["parse_mode"] = "HTML"
-        requests.post(_api("sendMessage"), json=datos, timeout=30).raise_for_status()
-
-
-AYUDA = ("👋 Escríbeme un nicho o producto y te mando lo que más vende en Amazon.es.\n"
-         "Ejemplos: perros · masajeador cervical · hogar, belleza\n"
-         "(Respondo en unos minutos.)")
-
-
-def leer_nichos_telegram() -> list[str]:
-    """Lee los mensajes nuevos del chat y devuelve los nichos pedidos."""
-    r = requests.get(_api("getUpdates"), params={"timeout": 0}, timeout=30)
-    r.raise_for_status()
-    novedades = r.json().get("result", [])
-    if not novedades:
-        return []
-    # Confirmar los mensajes para no procesarlos dos veces
-    ultimo = max(u["update_id"] for u in novedades)
-    requests.get(_api("getUpdates"), params={"offset": ultimo + 1, "timeout": 0}, timeout=30)
-
-    chat = str(os.environ["TELEGRAM_CHAT_ID"])
-    nichos = []
-    for u in novedades:
-        m = u.get("message") or {}
-        if str(m.get("chat", {}).get("id")) != chat:
-            continue
-        texto = (m.get("text") or "").strip()
-        if not texto:
-            continue
-        if re.match(r"(?i)^/(start|ayuda|help)\b", texto):
-            enviar(AYUDA, html_mode=False)
-            continue
-        texto = re.sub(r"(?i)^/(nicho|radar)(@\w+)?\s*", "", texto)
-        if texto.startswith("/"):
-            continue
-        for parte in texto.split(","):
-            parte = parte.strip()
-            if parte and len(parte) <= 60 and parte not in nichos:
-                nichos.append(parte)
-    return nichos[:5]
+        requests.post(url, json=datos, timeout=30).raise_for_status()
 
 
 # ───────────────────────── programa principal ─────────────────────────
-def procesar(nicho: str) -> bool:
-    nombre, secciones = recoger(nicho)
-    if not secciones:
-        # Amazon no dejó leer productos: se mandan igualmente los enlaces del propio nicho
-        enviar(
-            f"⚠️ No pude leer productos de Amazon para «{html.escape(nicho)}» "
-            "(Amazon suele bloquear las visitas desde GitHub).\n\n"
-            "Aun así, aquí tienes la búsqueda directa de ese nicho:\n"
-            f"{enlaces(nicho)}"
-        )
-        return False
-    enviar(formatear(nombre, secciones))
-    return True
-
-
 def main() -> int:
-    evento = os.environ.get("EVENTO", "").strip()  # cron que ha disparado la ejecución
-    manual = os.environ.get("NICHO", "").strip()
+    filtro = os.environ.get("FILTRO", "").strip()
+    try:
+        items = lanzar_scraper()
+    except ApifyError as e:
+        enviar(f"⚠️ Radar: {e}", html_mode=False)
+        print(e, file=sys.stderr)
+        return 1
 
-    if evento and evento != CRON_SEMANAL:  # ejecución de "escucha" de Telegram
-        nichos = leer_nichos_telegram()
-        if not nichos:
-            print("Sin mensajes nuevos")
-            return 0
-        enviar("🔎 Buscando: " + ", ".join(nichos) + " …", html_mode=False)
-    elif manual:
-        nichos = [n.strip() for n in manual.split(",") if n.strip()]
-    else:
-        nichos = NICHOS_POR_DEFECTO
-
-    fallos = 0
-    for n in nichos:
-        if not procesar(n):
-            fallos += 1
-    return 1 if fallos == len(nichos) else 0
+    print(f"Anuncios recibidos: {len(items)}")
+    productos = agrupar(items, filtro)
+    if not productos:
+        enviar("⚠️ El radar no encontró anuncios de producto esta vez"
+               + (f" con la palabra «{filtro}»" if filtro else "")
+               + ". Prueba otra vez o amplía las industrias en productos.py.", html_mode=False)
+        return 1
+    enviar(formatear(productos))
+    print(f"Enviados {min(TOP, len(productos))} productos")
+    return 0
 
 
 if __name__ == "__main__":
