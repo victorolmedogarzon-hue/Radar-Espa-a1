@@ -2,11 +2,15 @@ name: Radar semanal
 
 on:
   schedule:
-    - cron: "0 8 * * 1,4"   # lunes y jueves 8:00 UTC (10:00 en España en verano, 9:00 en invierno)
+    - cron: "0 8 * * 1"   # solo los lunes 8:00 UTC (10:00 en España en verano, 9:00 en invierno)
   workflow_dispatch:
     inputs:
       palabra:
         description: "Opcional: solo productos que contengan esta palabra (ej. cocina)"
+        required: false
+        default: ""
+      dataset_id:
+        description: "Opcional: ID de un dataset de Apify ya descargado (no gasta crédito)"
         required: false
         default: ""
 
@@ -28,4 +32,5 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           PALABRA: ${{ github.event.inputs.palabra }}
+          DATASET_ID: ${{ github.event.inputs.dataset_id }}
         run: python bot.py
