@@ -9,6 +9,7 @@ import os
 import re
 import unicodedata
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from urllib.parse import quote_plus
 
 import requests
@@ -17,20 +18,32 @@ from apify_client import ApifyClient
 ACTOR = "clockworks/tiktok-scraper"
 
 # ---------------------------------------------------------------- AJUSTES
+# COSTE: Apify cobra ~0,005 $ por vídeo. Vídeos pedidos = (hashtags + búsquedas) x VIDEOS_POR_TERMINO
 HASHTAGS = [
-    "tiktokmademebuyit", "tiktokmehizocomprarlo", "productoviral",
-    "comprastiktok", "amazonfinds", "gadgetsutiles", "hogarutil",
-    "cosasdealiexpress", "cosasutiles", "descubrimientostiktok",
+    "tiktokmehizocomprarlo", "productoviral", "comprastiktok",
+    "gadgetsutiles", "hogarutil",
 ]
 BUSQUEDAS = [
-    "producto viral", "me compré esto", "dónde lo compro",
-    "esto es una locura producto", "gadget útil", "no sabía que existía",
+    "producto viral", "me compré esto", "no sabía que existía",
 ]
-VIDEOS_POR_TERMINO = 40      # vídeos que pide a Apify por hashtag/búsqueda
-DIAS_MAX = 14                # solo vídeos de los últimos X días
-MIN_VISTAS = 20_000          # descarta vídeos con pocas vistas
-MAX_VIDEOS_A_IA = 80         # cuántos vídeos top se analizan con IA
-TOP_PRODUCTOS = 10           # cuántos productos se envían
+VIDEOS_POR_TERMINO = 12      # 8 términos x 12 = ~96 vídeos (~0,50 $ por ejecución)
+MAX_COSTE_USD = 0.60         # tope duro: Apify para el run si supera este gasto
+DIAS_MAX = 14                # criterio ESTRICTO: vídeos de los últimos X días
+MIN_VISTAS = 20_000          # criterio ESTRICTO: mínimo de vistas
+DIAS_RELAJADO = 30           # si faltan productos, se aceptan vídeos de hasta X días...
+MIN_VISTAS_RELAJADO = 5_000  # ...y con al menos estas vistas (se marcan con ⚠️)
+MIN_PRODUCTOS = 10           # el bot intenta SIEMPRE llegar a este mínimo
+TOP_PRODUCTOS = 20           # máximo de productos que se envían
+MAX_VIDEOS_A_IA = 120        # cuántos vídeos top se analizan con IA
+
+# Si con la primera búsqueda no se llega al mínimo, se hace UNA segunda con estos términos
+EXTRA_HASHTAGS = [
+    "tiktokmademebuyit", "amazonfinds", "cosasutiles", "descubrimientostiktok",
+    "cosasdealiexpress",
+]
+EXTRA_BUSQUEDAS = [
+    "gadget útil", "dónde lo compro", "esto es una locura producto",
+]
 
 # Si el vídeo lleva alguno de estos hashtags, es publicidad/colaboración
 TAGS_PUBLI = {
@@ -96,32 +109,61 @@ def _fecha(v):
 
 
 # ---------------------------------------------------------------- 1) RECOGER
-def recoger_videos(palabra=""):
+def _lanzar(client, run_input):
+    """Lanza el actor con tope de gasto (si la versión de apify-client lo soporta)."""
+    try:
+        return client.actor(ACTOR).call(
+            run_input=run_input, max_total_charge_usd=Decimal(str(MAX_COSTE_USD))
+        )
+    except TypeError:
+        return client.actor(ACTOR).call(run_input=run_input)
+
+
+def recoger_videos(palabra="", extra=False):
     token = _env("APIFY_TOKEN", "APIFY_API_TOKEN")
     if not token:
         raise SystemExit("Falta el secret APIFY_TOKEN")
     client = ApifyClient(token)
 
-    busquedas = list(BUSQUEDAS)
-    if palabra:
-        busquedas += [f"{palabra} viral", f"{palabra} me compré", f"{palabra} producto"]
+    # Si das un DATASET_ID reutiliza datos ya descargados: NO gasta crédito de Apify
+    dataset_id = _env("DATASET_ID").strip()
+    if dataset_id and extra:
+        return []
+    if dataset_id:
+        print(f"Reutilizando dataset {dataset_id} (sin coste)")
+    else:
+        busquedas = list(EXTRA_BUSQUEDAS if extra else BUSQUEDAS)
+        if palabra:
+            busquedas += [f"{palabra} viral", f"{palabra} me compré"]
 
-    run_input = {
-        "hashtags": HASHTAGS,
-        "searchQueries": busquedas,
-        "resultsPerPage": VIDEOS_POR_TERMINO,
-        "shouldDownloadVideos": False,
-        "shouldDownloadCovers": False,
-        "shouldDownloadSubtitles": False,
-        "proxyCountryCode": "ES",
-    }
-    try:
-        run = client.actor(ACTOR).call(run_input=run_input)
-    except Exception as e:  # por si el actor no acepta proxyCountryCode
-        print(f"Apify falló con proxyCountryCode ({e}); reintento sin él")
-        run_input.pop("proxyCountryCode", None)
-        run = client.actor(ACTOR).call(run_input=run_input)
-    return list(client.dataset(run["defaultDatasetId"]).iterate_items())
+        run_input = {
+            "hashtags": EXTRA_HASHTAGS if extra else HASHTAGS,
+            "searchQueries": busquedas,
+            "resultsPerPage": VIDEOS_POR_TERMINO,
+            "shouldDownloadVideos": False,
+            "shouldDownloadCovers": False,
+            "shouldDownloadSubtitles": False,
+            "proxyCountryCode": "ES",
+            "oldestPostDateUnified": (datetime.now(timezone.utc) - timedelta(days=DIAS_RELAJADO)).strftime("%Y-%m-%d"),
+        }
+        try:
+            run = _lanzar(client, run_input)
+        except Exception as e:  # por si el actor rechaza algún campo opcional
+            print(f"Apify falló ({e}); reintento sin proxyCountryCode ni fecha")
+            run_input.pop("proxyCountryCode", None)
+            run_input.pop("oldestPostDateUnified", None)
+            run = _lanzar(client, run_input)
+        # Compatible con versiones nuevas (objeto Run) y antiguas (diccionario) de apify-client
+        if isinstance(run, dict):
+            dataset_id = run.get("defaultDatasetId") or run.get("default_dataset_id")
+        else:
+            dataset_id = getattr(run, "default_dataset_id", None) or getattr(run, "defaultDatasetId", None)
+    if not dataset_id:
+        raise SystemExit(f"Apify no devolvió dataset. Respuesta: {run}")
+    items = []
+    for it in client.dataset(dataset_id).iterate_items():
+        items.append(it if isinstance(it, dict) else (it.model_dump(by_alias=True) if hasattr(it, "model_dump") else dict(it)))
+    return items
 
 
 # ---------------------------------------------------------------- 2) FILTRAR Y PUNTUAR
@@ -154,7 +196,10 @@ def _metricas(v):
 
 
 def filtrar_y_puntuar(items):
-    limite = datetime.now(timezone.utc) - timedelta(days=DIAS_MAX)
+    """Acepta vídeos con criterio RELAJADO y marca cuáles cumplen el ESTRICTO."""
+    ahora = datetime.now(timezone.utc)
+    lim_estricto = ahora - timedelta(days=DIAS_MAX)
+    lim_relajado = ahora - timedelta(days=DIAS_RELAJADO)
     vistos, salida = set(), []
     for v in items:
         vid = v.get("id") or v.get("webVideoUrl")
@@ -164,15 +209,17 @@ def filtrar_y_puntuar(items):
         if _es_anuncio(v):
             continue
         f = _fecha(v)
-        if f is None or f < limite:
+        if f is None or f < lim_relajado:
             continue
         if v.get("textLanguage") not in IDIOMAS_OK:
             continue
         m = _metricas(v)
-        if m["vistas"] < MIN_VISTAS:
+        if m["vistas"] < MIN_VISTAS_RELAJADO:
             continue
+        m["estricto"] = f >= lim_estricto and m["vistas"] >= MIN_VISTAS
         salida.append((v, m))
-    salida.sort(key=lambda x: x[1]["score"], reverse=True)
+    # primero los que cumplen el criterio estricto, luego por puntuación
+    salida.sort(key=lambda x: (x[1]["estricto"], x[1]["score"]), reverse=True)
     return salida[:MAX_VIDEOS_A_IA]
 
 
@@ -209,7 +256,7 @@ def _extraer_con_ia(videos):
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
             },
-            json={"model": modelo, "max_tokens": 4000,
+            json={"model": modelo, "max_tokens": 8000,
                   "messages": [{"role": "user", "content": prompt}]},
             timeout=120,
         )
@@ -272,22 +319,38 @@ def agrupar(videos):
         g["vistas"] = sum(m["vistas"] for _, m in g["videos"])
         g["inter"] = sum(m["inter"] for _, m in g["videos"]) / len(g["videos"])
         g["score"] = sum(m["score"] for _, m in mejor_por_creador.values())
+        g["estricto"] = any(m.get("estricto") for _, m in g["videos"])
         g["url"] = mejor[0].get("webVideoUrl", "")
         g.update(_enlaces(g["nombre"]))
         resultado.append(g)
-    resultado.sort(key=lambda g: g["score"], reverse=True)
+    resultado.sort(key=lambda g: (g["estricto"], g["score"]), reverse=True)
     return resultado
 
 
 # ---------------------------------------------------------------- API PRINCIPAL
-def buscar(palabra=""):
-    palabra = (palabra or "").strip()
-    items = recoger_videos(palabra)
-    print(f"Apify devolvió {len(items)} vídeos")
+def _procesar(items, palabra):
     videos = filtrar_y_puntuar(items)
-    print(f"Tras filtrar anuncios/antiguos/poco alcance: {len(videos)}")
+    print(f"Vídeos válidos (sin anuncios, últimos {DIAS_RELAJADO} días): {len(videos)}")
     grupos = agrupar(videos)
     if palabra:
         p = _sin_acentos(palabra)
         grupos = [g for g in grupos if p in _sin_acentos(g["nombre"] + " " + g["categoria"])]
+    print(f"Productos encontrados: {len(grupos)} "
+          f"({sum(1 for g in grupos if g['estricto'])} con criterio estricto)")
+    return grupos
+
+
+def buscar(palabra=""):
+    palabra = (palabra or "").strip()
+    items = recoger_videos(palabra)
+    print(f"Apify devolvió {len(items)} vídeos")
+    grupos = _procesar(items, palabra)
+
+    # Si no se llega al mínimo, una segunda búsqueda con más hashtags (solo 1 vez)
+    if len(grupos) < MIN_PRODUCTOS and not _env("DATASET_ID").strip():
+        print(f"Solo {len(grupos)} productos (mínimo {MIN_PRODUCTOS}): amplío la búsqueda")
+        extra = recoger_videos(palabra, extra=True)
+        print(f"Búsqueda ampliada: {len(extra)} vídeos más")
+        grupos = _procesar(items + extra, palabra)
+
     return grupos[:TOP_PRODUCTOS]
