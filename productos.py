@@ -39,6 +39,7 @@ MIN_VISTAS_RELAJADO = 20_000 # mismo mínimo por vídeo candidato
 VISTAS_VIRAL = 100_000
 MIN_PRODUCTOS = 30           # el bot intenta SIEMPRE llegar a este mínimo
 TOP_PRODUCTOS = 40           # máximo de productos que se envían
+MIN_NUEVOS_POR_RONDA = 4     # si una ronda aporta menos productos nuevos que esto, no se hace otra
 MAX_VIDEOS_A_IA = 400        # cuántos vídeos top se analizan con IA (en lotes de 80)
 
 # Si con la primera búsqueda no se llega al mínimo, se hace UNA segunda con estos términos
@@ -188,13 +189,19 @@ def recoger_videos(palabra="", ronda=0):
             dataset_id = getattr(run, "default_dataset_id", None) or getattr(run, "defaultDatasetId", None)
     if not dataset_id:
         raise SystemExit(f"Apify no devolvió dataset. Respuesta: {run}")
+    # DATASET_ID admite varios IDs separados por comas o espacios
+    ids = [x for x in re.split(r"[,\s]+", str(dataset_id)) if x]
     items = []
-    for it in client.dataset(dataset_id).iterate_items():
-        items.append(it if isinstance(it, dict) else (it.model_dump(by_alias=True) if hasattr(it, "model_dump") else dict(it)))
+    for did in ids:
+        for it in client.dataset(did).iterate_items():
+            items.append(it if isinstance(it, dict) else (it.model_dump(by_alias=True) if hasattr(it, "model_dump") else dict(it)))
     return items
 
 
 # ---------------------------------------------------------------- 2) FILTRAR Y PUNTUAR
+DIAG = {}  # recuento de por qué se descartan los vídeos (se muestra en el log y en Telegram)
+
+
 def _es_anuncio(v):
     if v.get("isAd") or v.get("isSponsored"):
         return True
@@ -239,23 +246,36 @@ def filtrar_y_puntuar(items):
     lim_estricto = ahora - timedelta(days=DIAS_MAX)
     lim_relajado = ahora - timedelta(days=DIAS_RELAJADO)
     vistos, salida = set(), []
+    d = {"recogidos": len(items), "duplicados": 0, "anuncios": 0, "vlogs_hauls": 0,
+         "sin_fecha_o_antiguos": 0, "idioma": 0, "pocas_vistas": 0}
     for v in items:
         vid = v.get("id") or v.get("webVideoUrl")
         if not vid or vid in vistos:
+            d["duplicados"] += 1
             continue
         vistos.add(vid)
-        if _es_anuncio(v) or _es_ruido(v):
+        if _es_anuncio(v):
+            d["anuncios"] += 1
+            continue
+        if _es_ruido(v):
+            d["vlogs_hauls"] += 1
             continue
         f = _fecha(v)
         if f is None or f < lim_relajado:
+            d["sin_fecha_o_antiguos"] += 1
             continue
         if v.get("textLanguage") not in IDIOMAS_OK:
+            d["idioma"] += 1
             continue
         m = _metricas(v)
         if m["vistas"] < MIN_VISTAS_RELAJADO:
+            d["pocas_vistas"] += 1
             continue
         m["estricto"] = f >= lim_estricto and m["vistas"] >= MIN_VISTAS
         salida.append((v, m))
+    d["validos"] = len(salida)
+    DIAG.clear()
+    DIAG.update(d)
     # primero los que cumplen el criterio estricto, luego por puntuación
     salida.sort(key=lambda x: (x[1]["estricto"], x[1]["score"]), reverse=True)
     return salida[:MAX_VIDEOS_A_IA]
@@ -343,10 +363,13 @@ def _enlaces(nombre):
 def agrupar(videos):
     ia = _extraer_con_ia(videos)
     grupos = {}
+    sin_producto = 0
+    DIAG["ia_activa"] = ia is not None
     for i, (v, m) in enumerate(videos):
         if ia is not None:
             d = ia.get(i)
             if not d:
+                sin_producto += 1
                 continue
             nombre = str(d["producto"]).strip()
             cat, prob = d.get("categoria", ""), d.get("problema", "")
@@ -356,6 +379,7 @@ def agrupar(videos):
             nombre = _nombre_sin_ia(v)
             cat = prob = ""
             if not nombre:
+                sin_producto += 1
                 continue
         g = grupos.setdefault(
             _sin_acentos(nombre),
@@ -364,6 +388,7 @@ def agrupar(videos):
         g["videos"].append((v, m))
 
     resultado = []
+    no_virales = 0
     for g in grupos.values():
         mejor_por_creador = {}
         for v, m in g["videos"]:
@@ -375,6 +400,7 @@ def agrupar(videos):
         g["vistas"] = sum(m["vistas"] for _, m in g["videos"])
         g["max_vistas"] = max(m["vistas"] for _, m in g["videos"])
         if g["max_vistas"] < VISTAS_VIRAL and g["vistas"] < VISTAS_VIRAL:
+            no_virales += 1
             continue  # no es viral: ni un vídeo ni la suma llegan al mínimo
         g["inter"] = sum(m["inter"] for _, m in g["videos"]) / len(g["videos"])
         g["score"] = sum(m["score"] for _, m in mejor_por_creador.values())
@@ -383,6 +409,9 @@ def agrupar(videos):
         g.update(_enlaces(g["nombre"]))
         resultado.append(g)
     resultado.sort(key=lambda g: (g["estricto"], g["score"]), reverse=True)
+    DIAG["sin_producto_claro"] = sin_producto
+    DIAG["productos_detectados"] = len(grupos)
+    DIAG["no_llegan_100k"] = no_virales
     return resultado
 
 
@@ -396,7 +425,27 @@ def _procesar(items, palabra):
         grupos = [g for g in grupos if p in _sin_acentos(g["nombre"] + " " + g["categoria"])]
     print(f"Productos encontrados: {len(grupos)} "
           f"({sum(1 for g in grupos if g['estricto'])} con criterio estricto)")
+    print(f"DIAGNÓSTICO: {dict(DIAG)}")
     return grupos
+
+
+def texto_diagnostico():
+    """Resumen corto de por qué se perdieron vídeos (para Telegram)."""
+    d = DIAG
+    if not d:
+        return ""
+    ia = "sí" if d.get("ia_activa") else "NO (falta ANTHROPIC_API_KEY o falló)"
+    return (
+        f"🔍 {d.get('recogidos', 0)} vídeos recogidos → descartados: "
+        f"{d.get('anuncios', 0)} anuncios, {d.get('vlogs_hauls', 0)} vlogs/hauls, "
+        f"{d.get('sin_fecha_o_antiguos', 0)} sin fecha o de hace +{DIAS_RELAJADO} días, "
+        f"{d.get('idioma', 0)} otro idioma, {d.get('pocas_vistas', 0)} con <{MIN_VISTAS // 1000}K vistas, "
+        f"{d.get('duplicados', 0)} repetidos → quedaron {d.get('validos', 0)}. "
+        f"De esos, {d.get('sin_producto_claro', 0)} sin producto claro; "
+        f"{d.get('productos_detectados', 0)} productos detectados, "
+        f"{d.get('no_llegan_100k', 0)} no llegan a {VISTAS_VIRAL // 1000}K visitas. "
+        f"IA activa: {ia}."
+    )
 
 
 def buscar(palabra=""):
@@ -410,10 +459,15 @@ def buscar(palabra=""):
     while (len(grupos) < MIN_PRODUCTOS and ronda < len(RONDAS)
            and not _env("DATASET_ID").strip()):
         print(f"Solo {len(grupos)} productos (mínimo {MIN_PRODUCTOS}): ronda {ronda + 1} de {len(RONDAS)}")
+        antes = len(grupos)
         extra = recoger_videos(palabra, ronda)
         print(f"Ronda {ronda + 1}: {len(extra)} vídeos más")
         items = items + extra
         grupos = _procesar(items, palabra)
         ronda += 1
+        # FRENO: si la ronda apenas aportó productos, no se gasta más crédito en otra
+        if len(grupos) - antes < MIN_NUEVOS_POR_RONDA:
+            print(f"La ronda solo aportó {len(grupos) - antes} productos nuevos: paro para no gastar más")
+            break
 
     return grupos[:TOP_PRODUCTOS]
