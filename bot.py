@@ -30,6 +30,8 @@ def _bloque(i, g):
               + (f" <i>({esc(g['categoria'])})</i>" if g["categoria"] else "")]
     if g["problema"]:
         lineas.append(f"💡 {esc(g['problema'])}")
+    if not g.get("estricto", True):
+        lineas.append("⚠️ Señal más débil (vídeo más antiguo o con menos vistas)")
     lineas.append(
         f"👥 {g['creadores']} creador(es) · 👁 {_fmt(g['vistas'])} vistas · "
         f"📈 {g['inter'] * 100:.1f}% interacción"
@@ -54,6 +56,9 @@ def construir_mensajes(grupos, palabra):
     if not grupos:
         return [titulo + "\n\nNo encontré productos con esos criterios esta vez."]
 
+    if len(grupos) < productos.MIN_PRODUCTOS:
+        titulo += (f"\n\n⚠️ Solo encontré {len(grupos)} productos (el mínimo era "
+                   f"{productos.MIN_PRODUCTOS}): TikTok/Apify no devolvieron más vídeos válidos esta vez.")
     bloques = [_bloque(i, g) for i, g in enumerate(grupos, 1)]
     pie = ("\n✅ Antes de vender: mira precio en AliExpress (margen ≥3x), "
            "que Trends suba y que no esté saturado en anuncios.")
