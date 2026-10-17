@@ -33,7 +33,8 @@ def _bloque(i, g):
     if not g.get("estricto", True):
         lineas.append("⚠️ Señal más débil (vídeo más antiguo, con menos vistas o producto poco claro)")
     lineas.append(
-        f"👥 {g['creadores']} creador(es) · 👁 {_fmt(g['vistas'])} vistas · "
+        f"👥 {g['creadores']} creador(es) · 👁 {_fmt(g['vistas'])} vistas totales "
+        f"(mejor vídeo: {_fmt(g.get('max_vistas', g['vistas']))}) · "
         f"📈 {g['inter'] * 100:.1f}% interacción"
     )
     enlaces = []
