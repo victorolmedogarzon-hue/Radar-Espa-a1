@@ -22,7 +22,7 @@ from bs4 import BeautifulSoup
 
 CRON_SEMANAL = "0 8 * * 1"  # tiene que coincidir con el cron semanal de radar.yml
 NICHOS_POR_DEFECTO = ["hogar", "belleza", "mascotas", "gadgets"]
-TOP = 7  # productos por lista
+TOP = 5  # productos por lista
 
 # Nichos que coinciden con una categoría de Amazon (ranking oficial).
 # Cualquier otro texto se busca directamente en Amazon.
@@ -147,6 +147,7 @@ def recoger(nicho: str) -> tuple[str, list[tuple[str, list[dict]]]]:
         nombre, slug = cat
         for etiqueta, ruta, movers in (
             ("🚀 Los que más suben", "movers-and-shakers", True),
+            ("🆕 Novedades que despegan", "new-releases", False),
             ("🏅 Más vendidos", "bestsellers", False),
         ):
             soup = descargar(f"https://www.amazon.es/gp/{ruta}/{slug}")
@@ -171,7 +172,7 @@ def recoger(nicho: str) -> tuple[str, list[tuple[str, list[dict]]]]:
 
 
 # ───────────────────────── enlaces de validación ─────────────────────────
-def termino(titulo: str, palabras: int = 4) -> str:
+def termino(titulo: str, palabras: int = 3) -> str:
     """Saca un término de búsqueda limpio del título de Amazon."""
     t = re.sub(r"(?i)\bby amazon\b|\bamazon basics\b", " ", titulo)
     t = re.split(r"\s[-–|]\s|[,(|]", t)[0]
@@ -319,11 +320,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
     try:
         sys.exit(main())
     except Exception as e:
