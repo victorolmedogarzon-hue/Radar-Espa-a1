@@ -22,7 +22,19 @@ from bs4 import BeautifulSoup
 
 CRON_SEMANAL = "0 8 * * 1"  # tiene que coincidir con el cron semanal de radar.yml
 NICHOS_POR_DEFECTO = ["hogar", "belleza", "mascotas", "gadgets"]
-TOP = 5  # productos por lista
+TOP = 6  # productos por lista
+
+# Filtros pensados para dropshipping ORGÁNICO (vídeos en TikTok/Reels):
+# producto barato, de compra por impulso, sin consumibles ni marcas de supermercado.
+PRECIO_MIN, PRECIO_MAX = 8.0, 60.0
+EXCLUIR = (
+    "comida", "pienso", "alimento", "snack", "croqueta", "arena para", "arenero",
+    "panal", "toallita", "champu", "gel de ducha", "detergente", "suavizante",
+    "papel higienico", "bolsas de basura", "bolsa de basura", "pilas", "cartucho",
+    "tinta", "cafe", "capsula", "vitamina", "suplemento", "proteina", "leche",
+    "galleta", "te verde", "infusion", "colonia", "perfume", "libro", "cable usb",
+    "protector de pantalla", "funda para", "recambio", "refill",
+)
 
 # Nichos que coinciden con una categoría de Amazon (ranking oficial).
 # Cualquier otro texto se busca directamente en Amazon.
@@ -139,6 +151,31 @@ def extraer_busqueda(soup: BeautifulSoup) -> list[dict]:
     return productos
 
 
+def precio_num(texto: str) -> float | None:
+    m = re.search(r"\d[\d.,]*", texto or "")
+    if not m:
+        return None
+    n = m.group(0)
+    n = n.replace(".", "").replace(",", ".") if "," in n else n
+    try:
+        return float(n)
+    except ValueError:
+        return None
+
+
+def apto_organico(p: dict) -> bool:
+    titulo = normalizar(p["titulo"])
+    if any(x in titulo for x in EXCLUIR):
+        return False
+    precio = precio_num(p["precio"])
+    return precio is None or PRECIO_MIN <= precio <= PRECIO_MAX
+
+
+def filtrar(prods: list[dict]) -> list[dict]:
+    aptos = [p for p in prods if apto_organico(p)]
+    return aptos if len(aptos) >= 3 else prods  # si el filtro deja muy poco, no se aplica
+
+
 def recoger(nicho: str) -> tuple[str, list[tuple[str, list[dict]]]]:
     """Devuelve (título del nicho, [(nombre de lista, productos)])."""
     cat = CATEGORIAS.get(normalizar(nicho))
@@ -148,7 +185,6 @@ def recoger(nicho: str) -> tuple[str, list[tuple[str, list[dict]]]]:
         for etiqueta, ruta, movers in (
             ("🚀 Los que más suben", "movers-and-shakers", True),
             ("🆕 Novedades que despegan", "new-releases", False),
-            ("🏅 Más vendidos", "bestsellers", False),
         ):
             soup = descargar(f"https://www.amazon.es/gp/{ruta}/{slug}")
             pausa()
@@ -156,6 +192,7 @@ def recoger(nicho: str) -> tuple[str, list[tuple[str, list[dict]]]]:
             print(f"{etiqueta} «{nicho}»: {len(prods)} productos leídos")
             if movers:
                 prods.sort(key=lambda p: p["cambio_num"], reverse=True)
+            prods = filtrar(prods)
             if prods:
                 secciones.append((etiqueta, prods[:TOP]))
     else:
@@ -164,7 +201,7 @@ def recoger(nicho: str) -> tuple[str, list[tuple[str, list[dict]]]]:
         url = f"https://www.amazon.es/s?k={quote_plus(nicho)}&s=exact-aware-popularity-rank"
         soup = descargar(url)
         pausa()
-        prods = extraer_busqueda(soup) if soup else []
+        prods = filtrar(extraer_busqueda(soup)) if soup else []
         print(f"Búsqueda «{nicho}»: {len(prods)} productos leídos")
         if prods:
             secciones.append(("🏅 Más populares en Amazon", prods[:TOP]))
@@ -185,21 +222,24 @@ def termino(titulo: str, palabras: int = 3) -> str:
 
 
 def enlaces(titulo: str) -> str:
-    q = quote_plus(termino(titulo))
-    meta = ("https://www.facebook.com/ads/library/?active_status=active&ad_type=all"
-            f"&country=ES&q={q}&search_type=keyword_unordered")
+    t = termino(titulo)
+    q = quote_plus(t)
     tiktok = f"https://www.tiktok.com/search/video?q={q}"
     # Instagram no tiene búsqueda de vídeos por palabra: se usa Google sobre sus reels
-    insta = "https://www.google.com/search?q=" + quote_plus(f"site:instagram.com/reel {termino(titulo)}")
+    insta = "https://www.google.com/search?q=" + quote_plus(f"site:instagram.com/reel {t}")
     trends = f"https://trends.google.es/trends/explore?geo=ES&q={q}"
+    ali = f"https://es.aliexpress.com/wholesale?SearchText={q}"
+    meta = ("https://www.facebook.com/ads/library/?active_status=active&ad_type=all"
+            f"&country=ES&q={q}&search_type=keyword_unordered")
     e = lambda u: html.escape(u, quote=True)
-    return (f'📢 <a href="{e(meta)}">Meta</a>  ·  🎵 <a href="{e(tiktok)}">TikTok</a>  ·  '
-            f'📸 <a href="{e(insta)}">Instagram</a>  ·  📊 <a href="{e(trends)}">Trends</a>')
+    return (f'🎵 <a href="{e(tiktok)}">TikTok</a>  ·  📸 <a href="{e(insta)}">Instagram</a>  ·  '
+            f'📊 <a href="{e(trends)}">Trends</a>\n'
+            f'    🛒 <a href="{e(ali)}">AliExpress</a>  ·  📢 <a href="{e(meta)}">Meta</a>')
 
 
 # ───────────────────────── formato del mensaje ─────────────────────────
 def formatear(nombre: str, secciones: list[tuple[str, list[dict]]]) -> str:
-    out = [f"<b>{html.escape(nombre)}</b>", "<i>Amazon.es · valida cada uno con los enlaces</i>"]
+    out = [f"<b>{html.escape(nombre)}</b>", "<i>Ideas para dropshipping orgánico · valida en TikTok/Reels antes de elegir</i>"]
     for etiqueta, prods in secciones:
         out += ["", f"<b>{etiqueta}</b>", "━━━━━━━━━━━━"]
         for i, p in enumerate(prods, 1):
