@@ -71,7 +71,11 @@ def descargar(url: str) -> BeautifulSoup | None:
         except requests.RequestException:
             r = None
         if r is not None and r.status_code == 200 and "validateCaptcha" not in r.text:
+            print(f"OK {r.status_code}: {url}")
             return BeautifulSoup(r.text, "html.parser")
+        motivo = "sin respuesta" if r is None else (
+            "captcha" if r.status_code == 200 else f"HTTP {r.status_code}")
+        print(f"FALLO ({motivo}): {url}")
         time.sleep(3)
     return None
 
@@ -148,6 +152,7 @@ def recoger(nicho: str) -> tuple[str, list[tuple[str, list[dict]]]]:
             soup = descargar(f"https://www.amazon.es/gp/{ruta}/{slug}")
             pausa()
             prods = extraer_ranking(soup, movers) if soup else []
+            print(f"{etiqueta} «{nicho}»: {len(prods)} productos leídos")
             if movers:
                 prods.sort(key=lambda p: p["cambio_num"], reverse=True)
             if prods:
@@ -159,6 +164,7 @@ def recoger(nicho: str) -> tuple[str, list[tuple[str, list[dict]]]]:
         soup = descargar(url)
         pausa()
         prods = extraer_busqueda(soup) if soup else []
+        print(f"Búsqueda «{nicho}»: {len(prods)} productos leídos")
         if prods:
             secciones.append(("🏅 Más populares en Amazon", prods[:TOP]))
     return nombre, secciones
@@ -278,8 +284,13 @@ def leer_nichos_telegram() -> list[str]:
 def procesar(nicho: str) -> bool:
     nombre, secciones = recoger(nicho)
     if not secciones:
-        enviar(f"⚠️ No pude leer Amazon para «{nicho}». Puede que haya bloqueado la visita "
-               "o que el nicho no devuelva resultados. Prueba con otra palabra.", html_mode=False)
+        # Amazon no dejó leer productos: se mandan igualmente los enlaces del propio nicho
+        enviar(
+            f"⚠️ No pude leer productos de Amazon para «{html.escape(nicho)}» "
+            "(Amazon suele bloquear las visitas desde GitHub).\n\n"
+            "Aun así, aquí tienes la búsqueda directa de ese nicho:\n"
+            f"{enlaces(nicho)}"
+        )
         return False
     enviar(formatear(nombre, secciones))
     return True
@@ -308,6 +319,11 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     try:
         sys.exit(main())
     except Exception as e:
