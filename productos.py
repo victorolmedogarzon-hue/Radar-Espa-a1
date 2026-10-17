@@ -26,15 +26,20 @@ HASHTAGS = [
 BUSQUEDAS = [
     "producto viral", "gadget que necesitas", "no sabía que existía",
 ]
-VIDEOS_POR_TERMINO = 12      # 8 términos x 12 = ~96 vídeos (~0,50 $ por ejecución)
-MAX_COSTE_USD = 0.60         # tope duro: Apify para el run si supera este gasto
+VIDEOS_POR_TERMINO = 35      # 8 términos x 35 = 280 vídeos por ronda (~1,40 $)
+MAX_COSTE_USD = 1.40         # tope duro POR RONDA: Apify para el run si supera este gasto
+# Hay hasta 3 rondas, así que el gasto máximo por semana es 3 x 1,40 = 4,20 $ (< 4,50 $).
+# El bot solo pasa a la siguiente ronda si todavía no ha llegado a MIN_PRODUCTOS.
 DIAS_MAX = 14                # criterio ESTRICTO: vídeos de los últimos X días
-MIN_VISTAS = 20_000          # criterio ESTRICTO: mínimo de vistas
-DIAS_RELAJADO = 30           # si faltan productos, se aceptan vídeos de hasta X días...
-MIN_VISTAS_RELAJADO = 5_000  # ...y con al menos estas vistas (se marcan con ⚠️)
-MIN_PRODUCTOS = 10           # el bot intenta SIEMPRE llegar a este mínimo
-TOP_PRODUCTOS = 20           # máximo de productos que se envían
-MAX_VIDEOS_A_IA = 120        # cuántos vídeos top se analizan con IA
+MIN_VISTAS = 20_000          # un vídeo candidato necesita al menos estas vistas
+DIAS_RELAJADO = 30           # si faltan productos, se aceptan vídeos de hasta X días (se marcan con ⚠️)
+MIN_VISTAS_RELAJADO = 20_000 # mismo mínimo por vídeo candidato
+# REGLA VIRAL (obligatoria): un producto solo se envía si UN vídeo suyo llega a esta cifra
+# o si la SUMA de todos sus vídeos llega a ella.
+VISTAS_VIRAL = 100_000
+MIN_PRODUCTOS = 30           # el bot intenta SIEMPRE llegar a este mínimo
+TOP_PRODUCTOS = 40           # máximo de productos que se envían
+MAX_VIDEOS_A_IA = 400        # cuántos vídeos top se analizan con IA (en lotes de 80)
 
 # Si con la primera búsqueda no se llega al mínimo, se hace UNA segunda con estos términos
 EXTRA_HASHTAGS = [
@@ -43,6 +48,18 @@ EXTRA_HASHTAGS = [
 ]
 EXTRA_BUSQUEDAS = [
     "gadget útil casa", "invento genial", "producto que tienes que tener",
+]
+# Tercera ronda (solo si las dos anteriores no bastan)
+EXTRA2_HASHTAGS = [
+    "gadgetscasa", "inventosutiles", "trucosdecasa", "organizacionhogar", "cocinagadgets",
+]
+EXTRA2_BUSQUEDAS = [
+    "cosas que no sabías que necesitabas", "producto que cambió mi vida", "mejor compra gadget",
+]
+RONDAS = [
+    (HASHTAGS, BUSQUEDAS),
+    (EXTRA_HASHTAGS, EXTRA_BUSQUEDAS),
+    (EXTRA2_HASHTAGS, EXTRA2_BUSQUEDAS),
 ]
 
 # Vídeos de compras/paseos/vlogs: NO son productos. Se descartan por texto o duración.
@@ -129,7 +146,7 @@ def _lanzar(client, run_input):
         return client.actor(ACTOR).call(run_input=run_input)
 
 
-def recoger_videos(palabra="", extra=False):
+def recoger_videos(palabra="", ronda=0):
     token = _env("APIFY_TOKEN", "APIFY_API_TOKEN")
     if not token:
         raise SystemExit("Falta el secret APIFY_TOKEN")
@@ -137,17 +154,18 @@ def recoger_videos(palabra="", extra=False):
 
     # Si das un DATASET_ID reutiliza datos ya descargados: NO gasta crédito de Apify
     dataset_id = _env("DATASET_ID").strip()
-    if dataset_id and extra:
+    if dataset_id and ronda > 0:
         return []
     if dataset_id:
         print(f"Reutilizando dataset {dataset_id} (sin coste)")
     else:
-        busquedas = list(EXTRA_BUSQUEDAS if extra else BUSQUEDAS)
+        hashtags_ronda, busquedas_ronda = RONDAS[ronda]
+        busquedas = list(busquedas_ronda)
         if palabra:
             busquedas += [f"{palabra} viral", f"{palabra} me compré"]
 
         run_input = {
-            "hashtags": EXTRA_HASHTAGS if extra else HASHTAGS,
+            "hashtags": hashtags_ronda,
             "searchQueries": busquedas,
             "resultsPerPage": VIDEOS_POR_TERMINO,
             "shouldDownloadVideos": False,
@@ -244,13 +262,8 @@ def filtrar_y_puntuar(items):
 
 
 # ---------------------------------------------------------------- 3) PRODUCTO (IA)
-def _extraer_con_ia(videos):
-    """Devuelve {indice: {producto, categoria, problema}} o None si no hay IA."""
-    clave = _env("ANTHROPIC_API_KEY")
-    if not clave:
-        return None
-    modelo = _env("ANTHROPIC_MODEL", default="claude-haiku-5-5")
-
+def _ia_lote(videos, clave, modelo):
+    """Analiza UN lote de vídeos. Devuelve {indice_local: datos}. Lanza excepción si falla."""
     lineas = []
     for i, (v, _) in enumerate(videos):
         tags = " ".join("#" + t for t in _hashtags(v)[:8])
@@ -275,25 +288,39 @@ def _extraer_con_ia(videos):
         "Nombres genéricos como 'gadget', 'cosa útil' o 'producto viral' NO valen.\n\n"
         + "\n".join(lineas)
     )
-    try:
-        r = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": clave,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={"model": modelo, "max_tokens": 8000,
-                  "messages": [{"role": "user", "content": prompt}]},
-            timeout=120,
-        )
-        r.raise_for_status()
-        texto = r.json()["content"][0]["text"]
-        datos = json.loads(texto[texto.find("["): texto.rfind("]") + 1])
-        return {int(d["i"]): d for d in datos if d.get("producto") and _num(d.get("confianza", 3)) >= 3}
-    except Exception as e:
-        print(f"IA no disponible ({e}); uso hashtags como alternativa")
+    r = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": clave,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json={"model": modelo, "max_tokens": 8000,
+              "messages": [{"role": "user", "content": prompt}]},
+        timeout=180,
+    )
+    r.raise_for_status()
+    texto = r.json()["content"][0]["text"]
+    datos = json.loads(texto[texto.find("["): texto.rfind("]") + 1])
+    return {int(d["i"]): d for d in datos if d.get("producto") and _num(d.get("confianza", 3)) >= 3}
+
+
+def _extraer_con_ia(videos, tam_lote=80):
+    """Devuelve {indice: {producto, categoria, problema, confianza}} o None si no hay IA."""
+    clave = _env("ANTHROPIC_API_KEY")
+    if not clave:
         return None
+    modelo = _env("ANTHROPIC_MODEL", default="claude-haiku-5-5")
+    resultado = {}
+    for base in range(0, len(videos), tam_lote):
+        try:
+            parcial = _ia_lote(videos[base: base + tam_lote], clave, modelo)
+        except Exception as e:
+            print(f"IA falló en el lote {base // tam_lote + 1} ({e}); sigo con los demás")
+            continue
+        for i, d in parcial.items():
+            resultado[base + i] = d
+    return resultado
 
 
 def _nombre_sin_ia(v):
@@ -346,6 +373,9 @@ def agrupar(videos):
         mejor = max(mejor_por_creador.values(), key=lambda x: x[1]["score"])
         g["creadores"] = len(mejor_por_creador)
         g["vistas"] = sum(m["vistas"] for _, m in g["videos"])
+        g["max_vistas"] = max(m["vistas"] for _, m in g["videos"])
+        if g["max_vistas"] < VISTAS_VIRAL and g["vistas"] < VISTAS_VIRAL:
+            continue  # no es viral: ni un vídeo ni la suma llegan al mínimo
         g["inter"] = sum(m["inter"] for _, m in g["videos"]) / len(g["videos"])
         g["score"] = sum(m["score"] for _, m in mejor_por_creador.values())
         g["estricto"] = any(m.get("estricto") for _, m in g["videos"])
@@ -375,13 +405,15 @@ def buscar(palabra=""):
     print(f"Apify devolvió {len(items)} vídeos")
     grupos = _procesar(items, palabra)
 
-    # Si no se llega al mínimo, una segunda búsqueda con más hashtags (solo 1 vez)
-    if len(grupos) < MIN_PRODUCTOS and not _env("DATASET_ID").strip():
-        print(f"Solo {len(grupos)} productos (mínimo {MIN_PRODUCTOS}): amplío la búsqueda")
-        extra = recoger_videos(palabra, extra=True)
-        print(f"Búsqueda ampliada: {len(extra)} vídeos más")
-        grupos = _procesar(items + extra, palabra)
-
-    return grupos[:TOP_PRODUCTOS]
+    # Si no se llega al mínimo, se añaden rondas de búsqueda (máx. 3 en total) hasta lograrlo
+    ronda = 1
+    while (len(grupos) < MIN_PRODUCTOS and ronda < len(RONDAS)
+           and not _env("DATASET_ID").strip()):
+        print(f"Solo {len(grupos)} productos (mínimo {MIN_PRODUCTOS}): ronda {ronda + 1} de {len(RONDAS)}")
+        extra = recoger_videos(palabra, ronda)
+        print(f"Ronda {ronda + 1}: {len(extra)} vídeos más")
+        items = items + extra
+        grupos = _procesar(items, palabra)
+        ronda += 1
 
     return grupos[:TOP_PRODUCTOS]
