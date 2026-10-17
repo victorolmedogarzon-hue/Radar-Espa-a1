@@ -1,114 +1,100 @@
-"""
-Radar semanal de productos para España (Telegram).
-Cada vez que se ejecuta te envía:
-  1) Enlaces a las fuentes gratuitas de "productos ganadores", ya filtradas por España.
-  2) Tu lista de seguimiento: enlaces directos a anuncios activos y tendencia de cada producto.
-  3) Las búsquedas que más suben hoy en Google España (feed RSS público).
-Solo usa la librería estándar de Python. No necesita claves de ninguna otra plataforma.
-"""
+"""Envía a Telegram el radar semanal de productos ganadores orgánicos."""
 import html
 import os
 import sys
-import urllib.error
-import urllib.parse
-import urllib.request
-import xml.etree.ElementTree as ET
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+import requests
 
-# Productos o nichos que quieres vigilar, separados por coma. Cámbialos cuando quieras.
-KEYWORDS = [k.strip() for k in os.getenv(
-    "KEYWORDS", "masajeador cervical, humidificador, organizador cocina"
-).split(",") if k.strip()][:10]
-
-GEO = os.getenv("GEO", "ES")  # país para Meta y Google Trends
+import productos
 
 
-def q(text):
-    return urllib.parse.quote_plus(text)
+def _env(*nombres):
+    for n in nombres:
+        v = os.getenv(n)
+        if v:
+            return v
+    return ""
 
 
-def esc(text):
-    return html.escape(text, quote=True)
+def _fmt(n):
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.0f}K"
+    return str(n)
 
 
-def meta_ads_url(keyword):
-    return ("https://www.facebook.com/ads/library/?active_status=active&ad_type=all"
-            f"&country={GEO}&q={q(keyword)}&search_type=keyword_unordered&media_type=all")
+def _bloque(i, g):
+    esc = html.escape
+    lineas = [f"🔥 <b>{i}. {esc(g['nombre'].capitalize())}</b>"
+              + (f" <i>({esc(g['categoria'])})</i>" if g["categoria"] else "")]
+    if g["problema"]:
+        lineas.append(f"💡 {esc(g['problema'])}")
+    lineas.append(
+        f"👥 {g['creadores']} creador(es) · 👁 {_fmt(g['vistas'])} vistas · "
+        f"📈 {g['inter'] * 100:.1f}% interacción"
+    )
+    enlaces = []
+    if g["url"]:
+        enlaces.append(f"🎬 <a href=\"{esc(g['url'])}\">Mejor vídeo</a>")
+    enlaces += [
+        f"🛒 <a href=\"{esc(g['aliexpress'])}\">AliExpress</a>",
+        f"📊 <a href=\"{esc(g['trends'])}\">Trends</a>",
+        f"🎵 <a href=\"{esc(g['tiktok'])}\">TikTok</a>",
+    ]
+    lineas.append(" · ".join(enlaces))
+    return "\n".join(lineas)
 
 
-def trends_url(keyword):
-    return f"https://trends.google.es/trends/explore?geo={GEO}&date=today%203-m&q={q(keyword)}"
+def construir_mensajes(grupos, palabra):
+    titulo = "🏆 <b>Productos ganadores ORGÁNICOS · TikTok España</b>\n"
+    titulo += f"<i>Últimos {productos.DIAS_MAX} días · sin anuncios · por interacción y nº de creadores</i>"
+    if palabra:
+        titulo += f"\n🔎 Filtro: <b>{html.escape(palabra)}</b>"
+    if not grupos:
+        return [titulo + "\n\nNo encontré productos con esos criterios esta vez."]
+
+    bloques = [_bloque(i, g) for i, g in enumerate(grupos, 1)]
+    pie = ("\n✅ Antes de vender: mira precio en AliExpress (margen ≥3x), "
+           "que Trends suba y que no esté saturado en anuncios.")
+    mensajes, actual = [], titulo
+    for b in bloques:
+        if len(actual) + len(b) + 40 > 3800:
+            mensajes.append(actual)
+            actual = ""
+        actual += "\n\n———————\n\n" + b if actual else b
+    mensajes.append(actual + "\n" + pie)
+    return mensajes
 
 
-def fetch_google_trending():
-    """Top de búsquedas en tendencia en Google (feed público). Si falla, devuelve lista vacía."""
-    url = f"https://trends.google.com/trending/rss?geo={GEO}"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (radar-bot)"})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            root = ET.fromstring(r.read())
-    except (urllib.error.URLError, ET.ParseError, TimeoutError) as e:
-        print("Aviso: no se pudo leer Google Trends:", e)
-        return []
-    out = []
-    for item in root.iter("item"):
-        title = (item.findtext("title") or "").strip()
-        traffic = ""
-        for child in item:
-            if child.tag.endswith("approx_traffic"):
-                traffic = (child.text or "").strip()
-        if title:
-            out.append((title, traffic))
-    return out[:10]
+def enviar(mensajes):
+    token = _env("TELEGRAM_TOKEN", "TELEGRAM_BOT_TOKEN", "BOT_TOKEN")
+    chat = _env("TELEGRAM_CHAT_ID", "CHAT_ID")
+    if not token or not chat:
+        print("Faltan TELEGRAM_TOKEN / TELEGRAM_CHAT_ID: muestro el mensaje por consola\n")
+        print("\n\n".join(mensajes))
+        return
+    for texto in mensajes:
+        r = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={
+                "chat_id": chat,
+                "text": texto,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=30,
+        )
+        if not r.ok:
+            raise SystemExit(f"Error de Telegram: {r.status_code} {r.text}")
 
 
-def build_message():
-    L = ["📡 <b>Radar semanal de productos · España</b>", ""]
-    L.append("🔎 <b>1. Fuentes para mirar hoy</b>")
-    L.append(f'• <a href="{esc(f"https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country={GEO}")}">'
-             "Biblioteca de anuncios de Meta (España)</a> → busca anuncios activos desde hace semanas")
-    L.append('• <a href="https://www.amazon.es/gp/movers-and-shakers">Amazon.es · Novedades más vendidas</a>')
-    L.append('• <a href="https://www.amazon.es/gp/bestsellers">Amazon.es · Más vendidos</a>')
-    L.append('• <a href="https://ads.tiktok.com/business/creativecenter">TikTok Creative Center</a> → elige región España')
-    L.append(f'• <a href="https://trends.google.es/trending?geo={GEO}">Google Trends España</a>')
-    L.append("")
-    if KEYWORDS:
-        L.append("👀 <b>2. Tu lista de seguimiento</b>")
-        for k in KEYWORDS:
-            L.append(f'• {esc(k)}: <a href="{esc(meta_ads_url(k))}">anuncios</a> · '
-                     f'<a href="{esc(trends_url(k))}">tendencia 3 meses</a>')
-        L.append("")
-    trending = fetch_google_trending()
-    if trending:
-        L.append("🔥 <b>3. Lo que más suben hoy en Google España</b>")
-        L.append("<i>(suelen ser noticias; úsalo solo como inspiración)</i>")
-        for i, (t, traffic) in enumerate(trending, 1):
-            L.append(f"{i}. {esc(t)}" + (f" ({esc(traffic)} búsquedas)" if traffic else ""))
-        L.append("")
-    L.append("✅ <b>Antes de vender un producto</b>")
-    L.append("• ¿Hay anuncios que llevan semanas activos en España?")
-    L.append("• ¿La tendencia es estable o sube, no un pico de un día?")
-    L.append("• Calcula tu margen real: producto + envío + IVA + publicidad + devoluciones.")
-    L.append("• Empieza con una prueba pequeña.")
-    L.append("")
-    L.append("<i>Esto son pistas, no garantías de ventas.</i>")
-    return "\n".join(L)[:4000]
-
-
-def send(text):
-    data = urllib.parse.urlencode({
-        "chat_id": TELEGRAM_CHAT_ID, "text": text,
-        "parse_mode": "HTML", "disable_web_page_preview": "true",
-    }).encode()
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        urllib.request.urlopen(urllib.request.Request(url, data=data, method="POST"), timeout=30).read()
-    except urllib.error.HTTPError as e:
-        sys.exit(f"Telegram devolvió error {e.code}: {e.read().decode('utf-8', 'ignore')[:300]}")
+def main():
+    palabra = (sys.argv[1] if len(sys.argv) > 1 else os.getenv("PALABRA", "")).strip()
+    grupos = productos.buscar(palabra)
+    enviar(construir_mensajes(grupos, palabra))
+    print(f"Enviados {len(grupos)} productos")
 
 
 if __name__ == "__main__":
-    send(build_message())
-    print("Radar enviado.")
+    main()
