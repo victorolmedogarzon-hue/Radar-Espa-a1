@@ -20,14 +20,18 @@ ACTOR = "clockworks/tiktok-scraper"
 
 # ---------------------------------------------------------------- AJUSTES
 # COSTE: Apify cobra ~0,005 $ por vídeo. Vídeos pedidos = (hashtags + búsquedas) x VIDEOS_POR_TERMINO
-HASHTAGS = [
-    "tiktokmehizocomprarlo", "productoviral", "comprastiktok",
-    "gadgetsutiles", "hogarutil",
-]
+# IMPORTANTE: los hashtags NO admiten filtro de fecha en este scraper (devuelven vídeos viejos),
+# por eso ahora se usan BÚSQUEDAS de vídeo, que sí permiten "más gustados del último mes".
+HASHTAGS = []
 BUSQUEDAS = [
-    "producto viral", "gadget que necesitas", "no sabía que existía",
+    "producto viral tiktok", "gadget que necesitas", "no sabía que existía",
+    "cosas útiles para casa", "invento genial", "producto que cambió mi vida",
+    "gadgets de cocina", "accesorios para el coche",
 ]
-VIDEOS_POR_TERMINO = 35      # 8 términos x 35 = 280 vídeos por ronda (~1,40 $)
+# Filtros de búsqueda del actor (campos "charged": pueden costar un extra, el tope MAX_COSTE_USD protege)
+BUSQUEDA_ORDEN = "MOST_LIKED"       # los más gustados = los virales
+BUSQUEDA_FECHA = "PAST_MONTH"       # PAST_WEEK = más fresco pero menos resultados
+VIDEOS_POR_TERMINO = 25      # 8 búsquedas x 25 = 200 vídeos por ronda
 MAX_COSTE_USD = 1.40         # tope duro POR RONDA: Apify para el run si supera este gasto
 # Hay hasta 3 rondas, así que el gasto máximo por semana es 3 x 1,40 = 4,20 $ (< 4,50 $).
 # El bot solo pasa a la siguiente ronda si todavía no ha llegado a MIN_PRODUCTOS.
@@ -38,26 +42,27 @@ MIN_VISTAS_RELAJADO = 20_000 # mismo mínimo por vídeo candidato
 # REGLA VIRAL (obligatoria): un producto solo se envía si UN vídeo suyo llega a esta cifra
 # o si la SUMA de todos sus vídeos llega a ella.
 VISTAS_VIRAL = 100_000
-MIN_PRODUCTOS = 30           # el bot intenta SIEMPRE llegar a este mínimo
+MIN_PRODUCTOS = 15           # el bot intenta SIEMPRE llegar a este mínimo
 TOP_PRODUCTOS = 40           # máximo de productos que se envían
 MIN_NUEVOS_POR_RONDA = 4     # si una ronda aporta menos productos nuevos que esto, no se hace otra
 MAX_VIDEOS_A_IA = 400        # cuántos vídeos top se analizan con IA (en lotes de 80)
 
 # Si con la primera búsqueda no se llega al mínimo, se hace UNA segunda con estos términos
-EXTRA_HASHTAGS = [
-    "tiktokmademebuyit", "amazonfinds", "cosasutiles", "descubrimientostiktok",
-    "cosasdealiexpress",
-]
+EXTRA_HASHTAGS = []
 EXTRA_BUSQUEDAS = [
-    "gadget útil casa", "invento genial", "producto que tienes que tener",
+    "gadgets baratos aliexpress", "cosas que necesitas en tu casa", "utensilios de cocina geniales",
+    "organizador para casa", "gadget para mascotas", "productos de belleza virales",
+    "regalos originales baratos", "producto que tienes que tener",
 ]
 # Tercera ronda (solo si las dos anteriores no bastan)
-EXTRA2_HASHTAGS = [
-    "gadgetscasa", "inventosutiles", "trucosdecasa", "organizacionhogar", "cocinagadgets",
-]
+EXTRA2_HASHTAGS = []
 EXTRA2_BUSQUEDAS = [
-    "cosas que no sabías que necesitabas", "producto que cambió mi vida", "mejor compra gadget",
+    "cosas que no sabías que necesitabas", "mejor compra gadget", "gadgets para el baño",
+    "gadget para el coche", "cosas para bebés útiles", "accesorios para el móvil virales",
+    "gadgets para el gimnasio", "productos para limpiar fácil",
 ]
+# Cuántas rondas como máximo (variable RONDAS_MAX; en pruebas manuales basta 1)
+RONDAS_MAX = int(os.getenv("RONDAS_MAX") or 3)
 RONDAS = [
     (HASHTAGS, BUSQUEDAS),
     (EXTRA_HASHTAGS, EXTRA_BUSQUEDAS),
@@ -167,21 +172,23 @@ def recoger_videos(palabra="", ronda=0):
             busquedas += [f"{palabra} viral", f"{palabra} me compré"]
 
         run_input = {
-            "hashtags": hashtags_ronda,
             "searchQueries": busquedas,
+            "searchSection": "/video",
+            "videoSearchSorting": BUSQUEDA_ORDEN,
+            "videoSearchDateFilter": BUSQUEDA_FECHA,
             "resultsPerPage": VIDEOS_POR_TERMINO,
             "shouldDownloadVideos": False,
             "shouldDownloadCovers": False,
-            "shouldDownloadSubtitles": False,
             "proxyCountryCode": "ES",
-            "oldestPostDateUnified": (datetime.now(timezone.utc) - timedelta(days=DIAS_RELAJADO)).strftime("%Y-%m-%d"),
         }
+        if hashtags_ronda:
+            run_input["hashtags"] = hashtags_ronda
         try:
             run = _lanzar(client, run_input)
         except Exception as e:  # por si el actor rechaza algún campo opcional
-            print(f"Apify falló ({e}); reintento sin proxyCountryCode ni fecha")
-            run_input.pop("proxyCountryCode", None)
-            run_input.pop("oldestPostDateUnified", None)
+            print(f"Apify falló ({e}); reintento sin los filtros opcionales")
+            for campo in ("proxyCountryCode", "videoSearchSorting", "videoSearchDateFilter", "searchSection"):
+                run_input.pop(campo, None)
             run = _lanzar(client, run_input)
         # Compatible con versiones nuevas (objeto Run) y antiguas (diccionario) de apify-client
         if isinstance(run, dict):
@@ -416,12 +423,14 @@ def agrupar(videos):
     ia = _extraer_con_ia(videos)
     grupos = {}
     sin_producto = 0
+    rechazados = []
     DIAG["ia_activa"] = ia is not None
     for i, (v, m) in enumerate(videos):
         if ia is not None:
             d = ia.get(i)
             if not d:
                 sin_producto += 1
+                rechazados.append((v.get("text") or "").replace("\n", " ")[:90])
                 continue
             nombre = str(d["producto"]).strip()
             cat, prob = d.get("categoria", ""), d.get("problema", "")
@@ -461,6 +470,10 @@ def agrupar(videos):
         g.update(_enlaces(g["nombre"]))
         resultado.append(g)
     resultado.sort(key=lambda g: (g["estricto"], g["score"]), reverse=True)
+    if rechazados:  # para ver en el log de GitHub qué textos la IA no pudo convertir en producto
+        print("EJEMPLOS SIN PRODUCTO CLARO:")
+        for t in rechazados[:15]:
+            print("  -", t)
     DIAG["sin_producto_claro"] = sin_producto
     DIAG["productos_detectados"] = len(grupos)
     DIAG["no_llegan_100k"] = no_virales
@@ -511,9 +524,9 @@ def buscar(palabra=""):
     if not DIAG.get("ia_activa") and len(grupos) < MIN_PRODUCTOS:
         print("La IA no funciona: NO lanzo más rondas de Apify (no tiene sentido gastar crédito)")
         return grupos[:TOP_PRODUCTOS]
-    while (len(grupos) < MIN_PRODUCTOS and ronda < len(RONDAS)
+    while (len(grupos) < MIN_PRODUCTOS and ronda < min(len(RONDAS), RONDAS_MAX)
            and not _env("DATASET_ID").strip()):
-        print(f"Solo {len(grupos)} productos (mínimo {MIN_PRODUCTOS}): ronda {ronda + 1} de {len(RONDAS)}")
+        print(f"Solo {len(grupos)} productos (mínimo {MIN_PRODUCTOS}): ronda {ronda + 1} de {min(len(RONDAS), RONDAS_MAX)}")
         antes = len(grupos)
         extra = recoger_videos(palabra, ronda)
         print(f"Ronda {ronda + 1}: {len(extra)} vídeos más")
