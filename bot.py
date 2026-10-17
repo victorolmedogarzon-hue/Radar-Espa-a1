@@ -55,11 +55,13 @@ def construir_mensajes(grupos, palabra):
     if palabra:
         titulo += f"\n🔎 Filtro: <b>{html.escape(palabra)}</b>"
     if not grupos:
-        return [titulo + "\n\nNo encontré productos con esos criterios esta vez."]
+        return [titulo + "\n\nNo encontré productos con esos criterios esta vez.\n\n"
+                + html.escape(productos.texto_diagnostico())]
 
     if len(grupos) < productos.MIN_PRODUCTOS:
         titulo += (f"\n\n⚠️ Solo encontré {len(grupos)} productos (el mínimo era "
-                   f"{productos.MIN_PRODUCTOS}): TikTok/Apify no devolvieron más vídeos válidos esta vez.")
+                   f"{productos.MIN_PRODUCTOS}): no hubo más vídeos que cumplan los filtros.")
+        titulo += "\n\n" + html.escape(productos.texto_diagnostico())
     bloques = [_bloque(i, g) for i, g in enumerate(grupos, 1)]
     pie = ("\n✅ Antes de vender: mira precio en AliExpress (margen ≥3x), "
            "que Trends suba y que no esté saturado en anuncios.")
