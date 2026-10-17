@@ -24,7 +24,7 @@ HASHTAGS = [
     "gadgetsutiles", "hogarutil",
 ]
 BUSQUEDAS = [
-    "producto viral", "me compré esto", "no sabía que existía",
+    "producto viral", "gadget que necesitas", "no sabía que existía",
 ]
 VIDEOS_POR_TERMINO = 12      # 8 términos x 12 = ~96 vídeos (~0,50 $ por ejecución)
 MAX_COSTE_USD = 0.60         # tope duro: Apify para el run si supera este gasto
@@ -42,8 +42,18 @@ EXTRA_HASHTAGS = [
     "cosasdealiexpress",
 ]
 EXTRA_BUSQUEDAS = [
-    "gadget útil", "dónde lo compro", "esto es una locura producto",
+    "gadget útil casa", "invento genial", "producto que tienes que tener",
 ]
+
+# Vídeos de compras/paseos/vlogs: NO son productos. Se descartan por texto o duración.
+DURACION_MAX = 75            # segundos; los vlogs y hauls suelen durar más
+PALABRAS_EXCLUIDAS = {
+    "bazar", "bazaar", "bazares", "haul", "vlog", "mercadillo", "mercado", "rastro",
+    "zoco", "tour", "paseo", "shopping", "tienda", "tiendas", "comprando", "compras",
+    "primark", "ikea", "mercadona", "lidl", "carrefour", "action", "tedi", "leroy",
+    "outlet", "rebajas", "viaje", "turquia", "dubai", "marruecos", "grwm", "ootd",
+    "tryon", "tryonhaul", "sheinhaul", "unboxing", "pedido",
+}
 
 # Si el vídeo lleva alguno de estos hashtags, es publicidad/colaboración
 TAGS_PUBLI = {
@@ -176,6 +186,16 @@ def _es_anuncio(v):
     return bool(re.search(r"#(ad|publi|sponsored|patrocinado)\b|paid partnership", texto))
 
 
+def _es_ruido(v):
+    """Vlogs, hauls, paseos por tiendas/bazares y vídeos demasiado largos."""
+    dur = _num((v.get("videoMeta") or {}).get("duration"))
+    if dur and dur > DURACION_MAX:
+        return True
+    texto = _sin_acentos(v.get("text", "")) + " " + " ".join(_hashtags(v))
+    palabras = set(re.findall(r"[a-z0-9ñ]+", texto))
+    return bool(palabras & PALABRAS_EXCLUIDAS)
+
+
 def _metricas(v):
     vistas = max(_num(v.get("playCount")), 1)
     likes = _num(v.get("diggCount"))
@@ -206,7 +226,7 @@ def filtrar_y_puntuar(items):
         if not vid or vid in vistos:
             continue
         vistos.add(vid)
-        if _es_anuncio(v):
+        if _es_anuncio(v) or _es_ruido(v):
             continue
         f = _fecha(v)
         if f is None or f < lim_relajado:
@@ -238,14 +258,21 @@ def _extraer_con_ia(videos):
         lineas.append(f"{i}. {texto} {tags}")
 
     prompt = (
-        "Estos son vídeos orgánicos de TikTok España. Para cada uno identifica el "
-        "PRODUCTO FÍSICO que se muestra o recomienda.\n"
+        "Eres analista de dropshipping. Estos son textos de vídeos orgánicos de TikTok España. "
+        "Para cada uno decide si el vídeo trata de UN ÚNICO PRODUCTO FÍSICO concreto que se "
+        "podría vender online (gadget, accesorio, utensilio, artículo de hogar, belleza, mascotas, "
+        "coche, etc.).\n"
         "Devuelve SOLO un JSON (lista) con objetos "
-        '{"i": número, "producto": "nombre genérico en español, minúsculas, 2-4 palabras", '
-        '"categoria": "una palabra", "problema": "qué problema resuelve, máx 10 palabras"}.\n'
-        "Si el vídeo NO vende/recomienda un producto físico (humor, receta, servicio, app, "
-        "famoso, marca grande como Apple/Nike/Dyson, medicamento o suplemento), "
-        'pon "producto": null. Usa el MISMO nombre para el mismo producto en distintos vídeos.\n\n'
+        '{"i": número, "producto": "nombre específico del producto en español, minúsculas, 2-4 palabras", '
+        '"categoria": "una palabra", "problema": "qué problema resuelve, máx 10 palabras", '
+        '"confianza": 1-5}.\n'
+        'Pon "producto": null si el vídeo es: compras o paseo por una tienda/bazar/mercado/centro comercial, '
+        "vlog, haul con varios productos, lista de varias cosas, ropa de moda genérica, comida o receta, "
+        "humor, servicio, app, viaje, persona famosa, marca grande (Apple, Nike, Dyson…), "
+        "medicamento o suplemento, o si el texto NO permite saber qué producto concreto es.\n"
+        '"confianza" = lo seguro que estás de que es un único producto concreto (5 = el texto lo nombra claramente; '
+        "3 = lo deduces; menos de 3 = no lo pongas). Usa el MISMO nombre para el mismo producto en distintos vídeos. "
+        "Nombres genéricos como 'gadget', 'cosa útil' o 'producto viral' NO valen.\n\n"
         + "\n".join(lineas)
     )
     try:
@@ -263,7 +290,7 @@ def _extraer_con_ia(videos):
         r.raise_for_status()
         texto = r.json()["content"][0]["text"]
         datos = json.loads(texto[texto.find("["): texto.rfind("]") + 1])
-        return {int(d["i"]): d for d in datos if d.get("producto")}
+        return {int(d["i"]): d for d in datos if d.get("producto") and _num(d.get("confianza", 3)) >= 3}
     except Exception as e:
         print(f"IA no disponible ({e}); uso hashtags como alternativa")
         return None
@@ -296,6 +323,8 @@ def agrupar(videos):
                 continue
             nombre = str(d["producto"]).strip()
             cat, prob = d.get("categoria", ""), d.get("problema", "")
+            # si la IA no está muy segura (confianza 3), el producto sale como "señal más débil"
+            m["estricto"] = bool(m.get("estricto")) and _num(d.get("confianza", 3)) >= 4
         else:
             nombre = _nombre_sin_ia(v)
             cat = prob = ""
@@ -352,5 +381,7 @@ def buscar(palabra=""):
         extra = recoger_videos(palabra, extra=True)
         print(f"Búsqueda ampliada: {len(extra)} vídeos más")
         grupos = _procesar(items + extra, palabra)
+
+    return grupos[:TOP_PRODUCTOS]
 
     return grupos[:TOP_PRODUCTOS]
