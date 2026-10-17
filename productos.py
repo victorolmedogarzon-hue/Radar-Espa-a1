@@ -7,6 +7,7 @@ producto con IA (opcional) -> agrupación por producto -> ranking.
 import json
 import os
 import re
+import time
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -282,7 +283,56 @@ def filtrar_y_puntuar(items):
 
 
 # ---------------------------------------------------------------- 3) PRODUCTO (IA)
-def _ia_lote(videos, clave, modelo):
+ERROR_IA = {"ultimo": ""}  # último error de la IA, se muestra en el diagnóstico
+
+
+def _llamar_ia(prompt, proveedor, clave, modelo):
+    """Envía el prompt a Gemini (gratis) o a Claude y devuelve el texto de la respuesta."""
+    if proveedor == "gemini":
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent"
+        # Las claves nuevas de AI Studio ("AQ....") pueden requerir otro método de envío:
+        # se prueba x-goog-api-key y, si Google responde 401/403, Authorization: Bearer.
+        metodos = [{"x-goog-api-key": clave}, {"Authorization": f"Bearer {clave}"}]
+        m_idx = 0
+        for intento in range(1, 6):  # la capa gratuita tiene límite por minuto: reintenta si hace falta
+            r = requests.post(
+                url,
+                headers={**metodos[m_idx], "content-type": "application/json"},
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": 0, "maxOutputTokens": 12000},
+                },
+                timeout=180,
+            )
+            if r.status_code in (401, 403) and m_idx == 0:
+                print(f"Gemini {r.status_code} con x-goog-api-key; pruebo con Authorization: Bearer")
+                m_idx = 1
+                continue
+            if r.status_code in (429, 500, 503) and intento < 5:
+                print(f"Gemini ocupado ({r.status_code}); espero y reintento")
+                time.sleep(20 * intento)
+                continue
+            if not r.ok:
+                raise RuntimeError(f"Gemini {r.status_code}: {r.text[:300]}")
+            partes = r.json()["candidates"][0]["content"]["parts"]
+            return "".join(p.get("text", "") for p in partes)
+    r = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": clave,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json={"model": modelo, "max_tokens": 8000,
+              "messages": [{"role": "user", "content": prompt}]},
+        timeout=180,
+    )
+    if not r.ok:
+        raise RuntimeError(f"Claude {r.status_code}: {r.text[:300]}")
+    return r.json()["content"][0]["text"]
+
+
+def _ia_lote(videos, proveedor, clave, modelo):
     """Analiza UN lote de vídeos. Devuelve {indice_local: datos}. Lanza excepción si falla."""
     lineas = []
     for i, (v, _) in enumerate(videos):
@@ -308,38 +358,40 @@ def _ia_lote(videos, clave, modelo):
         "Nombres genéricos como 'gadget', 'cosa útil' o 'producto viral' NO valen.\n\n"
         + "\n".join(lineas)
     )
-    r = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": clave,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        json={"model": modelo, "max_tokens": 8000,
-              "messages": [{"role": "user", "content": prompt}]},
-        timeout=180,
-    )
-    r.raise_for_status()
-    texto = r.json()["content"][0]["text"]
+    texto = _llamar_ia(prompt, proveedor, clave, modelo)
     datos = json.loads(texto[texto.find("["): texto.rfind("]") + 1])
     return {int(d["i"]): d for d in datos if d.get("producto") and _num(d.get("confianza", 3)) >= 3}
 
 
-def _extraer_con_ia(videos, tam_lote=80):
-    """Devuelve {indice: {producto, categoria, problema, confianza}} o None si no hay IA."""
-    clave = _env("ANTHROPIC_API_KEY")
-    if not clave:
+def _extraer_con_ia(videos, tam_lote=60):
+    """Devuelve {indice: {producto, categoria, problema, confianza}} o None si no hay IA.
+
+    Usa Gemini (capa gratuita) si existe GEMINI_API_KEY; si no, Claude con ANTHROPIC_API_KEY.
+    """
+    if _env("GEMINI_API_KEY"):
+        proveedor, clave = "gemini", _env("GEMINI_API_KEY")
+        modelo = _env("GEMINI_MODEL", default="gemini-3.5-flash-lite")
+    elif _env("ANTHROPIC_API_KEY"):
+        proveedor, clave = "claude", _env("ANTHROPIC_API_KEY")
+        modelo = _env("ANTHROPIC_MODEL", default="claude-haiku-5-5")
+    else:
+        ERROR_IA["ultimo"] = "no hay GEMINI_API_KEY ni ANTHROPIC_API_KEY"
         return None
-    modelo = _env("ANTHROPIC_MODEL", default="claude-haiku-5-5")
-    resultado = {}
+    resultado, lotes_ok, lotes = {}, 0, 0
     for base in range(0, len(videos), tam_lote):
+        lotes += 1
         try:
-            parcial = _ia_lote(videos[base: base + tam_lote], clave, modelo)
+            parcial = _ia_lote(videos[base: base + tam_lote], proveedor, clave, modelo)
         except Exception as e:
-            print(f"IA falló en el lote {base // tam_lote + 1} ({e}); sigo con los demás")
+            ERROR_IA["ultimo"] = f"{proveedor}/{modelo}: {e}"
+            print(f"IA falló en el lote {lotes} ({e}); sigo con los demás")
             continue
+        lotes_ok += 1
         for i, d in parcial.items():
             resultado[base + i] = d
+    if lotes and lotes_ok == 0:
+        return None  # la IA no respondió en ningún lote: se avisa en el diagnóstico
+    ERROR_IA["ultimo"] = ""
     return resultado
 
 
@@ -434,7 +486,7 @@ def texto_diagnostico():
     d = DIAG
     if not d:
         return ""
-    ia = "sí" if d.get("ia_activa") else "NO (falta ANTHROPIC_API_KEY o falló)"
+    ia = "sí" if d.get("ia_activa") else f"NO ({ERROR_IA['ultimo'] or 'falló'})"
     return (
         f"🔍 {d.get('recogidos', 0)} vídeos recogidos → descartados: "
         f"{d.get('anuncios', 0)} anuncios, {d.get('vlogs_hauls', 0)} vlogs/hauls, "
@@ -456,6 +508,9 @@ def buscar(palabra=""):
 
     # Si no se llega al mínimo, se añaden rondas de búsqueda (máx. 3 en total) hasta lograrlo
     ronda = 1
+    if not DIAG.get("ia_activa") and len(grupos) < MIN_PRODUCTOS:
+        print("La IA no funciona: NO lanzo más rondas de Apify (no tiene sentido gastar crédito)")
+        return grupos[:TOP_PRODUCTOS]
     while (len(grupos) < MIN_PRODUCTOS and ronda < len(RONDAS)
            and not _env("DATASET_ID").strip()):
         print(f"Solo {len(grupos)} productos (mínimo {MIN_PRODUCTOS}): ronda {ronda + 1} de {len(RONDAS)}")
